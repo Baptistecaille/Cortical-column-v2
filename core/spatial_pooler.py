@@ -16,14 +16,19 @@ Annealing (§7.2) :
         - Boost    : b_i*(t) = 1 + γ(t)·(b_i − 1)
         - Dépression : δ⁻(t) = δ⁻·γ(t)
 
+GPU :
+    Toutes les opérations critiques (forward_batch, hebbian_update_batch)
+    sont vectorisées — zéro boucle Python, compatibles MPS/CUDA.
+    L'initialisation du potential pool utilise argsort au lieu d'une boucle.
+
 Règle absolue : aucun autograd — tout @torch.no_grad() ou .data
 Réf. math : §2, Déf. 2.1, Thm 2.2 — Formalisation_Mille_Cerveaux.pdf
 """
 
 import torch
 import torch.nn as nn
-from typing import Tuple
 import math
+import warnings
 
 
 class SpatialPooler(nn.Module):
@@ -32,6 +37,11 @@ class SpatialPooler(nn.Module):
 
     Les permanences synaptiques sont stockées comme buffer (pas Parameter)
     et mises à jour exclusivement par la règle hebbienne sans autograd.
+
+    Interface simple  : forward(x)               → active (k,)
+                        hebbian_update(x, active) → None
+    Interface batched : forward_batch(x_batch)   → active_batch (B, k)
+                        hebbian_update_batch(...)  → None  [GPU-optimisé]
 
     Args:
         n_inputs:       dimension du SDR d'entrée (= SDRSpace.n)
@@ -78,17 +88,19 @@ class SpatialPooler(nn.Module):
         self.sigma = sigma
         self.beta = beta
 
-        # ── Potential pool ────────────────────────────────────────────────
-        # Masque booléen fixé à l'init : chaque colonne n'a des synapses
-        # candidats que sur un sous-ensemble de potential_pct × n_inputs bits.
-        # Sans pool, δ− s'applique à 98% des bits sur MNIST (w/n≈2%),
-        # ce qui écrase les permanences vers 0.
+        # ── Potential pool (vectorisé, sans boucle Python) ────────────────
+        # Chaque colonne n'a des synapses candidates que sur un sous-ensemble
+        # de potential_pct × n_inputs bits. Résout l'effondrement des
+        # permanences dû au déséquilibre δ+/δ− avec des SDRs creux.
         n_potential = max(1, int(potential_pct * n_inputs))
+        # argsort d'un bruit aléatoire : permutation indépendante par ligne
+        noise = torch.rand(n_columns, n_inputs)
+        top_idx = torch.argsort(noise, dim=1)[:, :n_potential]   # (C, n_potential)
         potential_mask = torch.zeros(n_columns, n_inputs, dtype=torch.bool)
-        for i in range(n_columns):
-            idx = torch.randperm(n_inputs)[:n_potential]
-            potential_mask[i, idx] = True
+        potential_mask.scatter_(1, top_idx, True)
         self.register_buffer("potential_mask", potential_mask)
+        # Masque float précompilé pour les matmuls (évite le cast répété)
+        self.register_buffer("potential_mask_f", potential_mask.float())
 
         # ── Permanences synaptiques ──────────────────────────────────────
         # p_ij ∈ [0,1], shape (n_columns, n_inputs)
@@ -101,19 +113,14 @@ class SpatialPooler(nn.Module):
         self.register_buffer("permanences", permanences)
 
         # ── Vérification de l'équilibre δ+/δ− ────────────────────────────
-        # Condition d'équilibre : w_pool·δ+ ≈ (n_pool - w_pool)·δ−
-        # où w_pool ≈ k (colonnes actives, approximation au premier ordre)
-        # Si violée, les permanences s'effondrent vers 0.
         n_pool = int(potential_pct * n_inputs)
-        w_effective = max(1, int(k * n_inputs / n_columns))  # bits actifs par colonne
+        w_effective = max(1, int(k * n_inputs / n_columns))
         equilibrium_ratio = (n_pool - w_effective) / max(w_effective, 1)
         actual_ratio = delta_plus / max(delta_minus, 1e-9)
         if actual_ratio < equilibrium_ratio * 0.5:
-            import warnings
             warnings.warn(
                 f"SpatialPooler : déséquilibre δ+/δ− probable. "
                 f"Ratio actuel δ+/δ−={actual_ratio:.1f}, équilibre requis ≈{equilibrium_ratio:.1f}. "
-                f"Les permanences risquent de s'effondrer. "
                 f"Suggestion : delta_minus ≤ {delta_plus / equilibrium_ratio:.4f}",
                 UserWarning,
                 stacklevel=2,
@@ -127,7 +134,6 @@ class SpatialPooler(nn.Module):
         self.register_buffer("t_step", torch.tensor(0, dtype=torch.long))
 
         # ── Topologie des colonnes pour boost homeöstatique ───────────────
-        # Grille 2D : sqrt(n_columns) × sqrt(n_columns)
         side = int(math.isqrt(n_columns))
         assert side * side == n_columns, (
             f"n_columns={n_columns} doit être un carré parfait pour la topologie 2D"
@@ -139,165 +145,177 @@ class SpatialPooler(nn.Module):
                 indexing="ij",
             ),
             dim=-1,
-        ).reshape(n_columns, 2)  # (n_columns, 2)
+        ).reshape(n_columns, 2)
         self.register_buffer("coords", coords)
 
-        # Distance inter-colonnes précompilée : (n_columns, n_columns)
-        diff = coords.unsqueeze(0) - coords.unsqueeze(1)  # (C,C,2)
-        dist = diff.norm(dim=-1)                          # (C,C)
+        diff = coords.unsqueeze(0) - coords.unsqueeze(1)   # (C, C, 2)
+        dist = diff.norm(dim=-1)                            # (C, C)
         self.register_buffer("col_dist", dist)
+
+        # Poids gaussiens précompilés (ne changent pas)
+        weights = torch.exp(-0.5 * (dist / sigma) ** 2)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        self.register_buffer("boost_weights", weights)
 
     # ── Annealing ────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def gamma(self) -> float:
-        """
-        Facteur d'annealing γ(t) ∈ [0,1], schedule linéaire par morceaux.
-
-        Réf. math : §7.2, Éq. 7.3.
-
-        Returns:
-            γ(t) : float dans [0,1]
-        """
+        """γ(t) ∈ [0,1], schedule linéaire par morceaux. Réf. §7.2."""
         t = self.t_step.item()
-        m = self.newborn_steps
-        tau = self.tau_decay
-
+        m, tau = self.newborn_steps, self.tau_decay
         if t < m:
             return 1.0
         elif t < m + tau:
             return 1.0 - (t - m) / tau
-        else:
-            return 0.0
+        return 0.0
 
     # ── Boost homeöstatique ───────────────────────────────────────────────
 
     @torch.no_grad()
     def _compute_boost(self) -> torch.Tensor:
         """
-        Calcule le facteur de boost b_i*(t) = 1 + γ(t)·(b_i − 1).
-
-        b_i est le boost homeöstatique basé sur la densité locale :
-            b_i = exp(β · (μ_voisins − d_i))
-        où d_i est le duty cycle de la colonne i et μ_voisins est
-        le duty cycle moyen du voisinage gaussien.
+        Boost b_i*(t) = 1 + γ(t)·(exp(β·(μ_voisins − d_i)) − 1).
 
         Réf. math : §2.4, Éq. 2.7.
 
         Returns:
-            boost: facteur de boost par colonne, shape (n_columns,)
+            boost: shape (n_columns,)
         """
-        g = self.gamma()
+        mu = self.boost_weights @ self.duty_cycle          # (C,)
+        b_base = torch.exp(self.beta * (mu - self.duty_cycle))
+        return 1.0 + self.gamma() * (b_base - 1.0)
 
-        # Poids gaussien des voisins : (n_columns, n_columns)
-        weights = torch.exp(-0.5 * (self.col_dist / self.sigma) ** 2)
-        weights = weights / weights.sum(dim=-1, keepdim=True)
-
-        # Duty cycle moyen des voisins
-        mu_neighbors = weights @ self.duty_cycle  # (n_columns,)
-
-        # Boost de base
-        b_base = torch.exp(self.beta * (mu_neighbors - self.duty_cycle))
-
-        # Boost annealed : b_i*(t) = 1 + γ(t)·(b_i − 1)
-        boost = 1.0 + g * (b_base - 1.0)
-        return boost
-
-    # ── Forward ───────────────────────────────────────────────────────────
+    # ── Forward — interface simple (1 sample) ────────────────────────────
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Sélectionne les k colonnes actives par overlap boosté.
+        Sélectionne les k colonnes actives. Invariant I2.1 : |A_t| = k.
 
-        Invariant I2.1 : |A_t| = k exactement.
+        Args:
+            x: SDR binaire, shape (n_inputs,)
+
+        Returns:
+            active: indices, shape (k,)
+        """
+        return self.forward_batch(x.unsqueeze(0)).squeeze(0)
+
+    # ── Forward — interface batché (GPU-optimisé) ────────────────────────
+
+    @torch.no_grad()
+    def forward_batch(self, x_batch: torch.Tensor) -> torch.Tensor:
+        """
+        Sélectionne les k colonnes actives pour un batch de SDRs.
+
+        Invariant I2.1 : |A_t| = k exactement par ligne.
+
+        Implémentation : overlap = x_batch @ connected.T → (B, C)
+        Zéro boucle Python — compatible MPS/CUDA.
 
         Réf. math : §2.3, Déf. 2.1.
 
         Args:
-            x: SDR binaire, shape (n_inputs,), ||x||₁ = w
+            x_batch: SDRs binaires, shape (B, n_inputs)
 
         Returns:
-            active: indices des k colonnes gagnantes, shape (k,)
+            active_batch: indices des k colonnes, shape (B, k)
         """
-        # Overlap : synapses connectées (dans pool ET permanence > seuil) × SDR
-        connected = (self.permanences >= self.connected_perm) & self.potential_mask
-        overlap = connected.float() @ x  # (C,)
+        # Matrice de connectivité : (C, n_inputs) — seuil + pool
+        connected_f = (
+            (self.permanences >= self.connected_perm) & self.potential_mask
+        ).float()
 
-        # Boost homeöstatique
-        boost = self._compute_boost()  # (C,)
-        boosted_overlap = boost * overlap  # (C,)
+        # Overlap boosté : (B, C)
+        overlap = x_batch.float() @ connected_f.T
+        boost = self._compute_boost()                     # (C,)
+        boosted = overlap * boost.unsqueeze(0)            # (B, C)
 
-        # Top-k strict — I2.1 garanti
-        _, active = torch.topk(boosted_overlap, self.k, sorted=False)
-        return active  # shape (k,)
+        # Top-k par ligne — I2.1 garanti
+        _, active_batch = torch.topk(boosted, self.k, dim=-1, sorted=False)
+        return active_batch   # (B, k)
 
-    # ── Apprentissage hebbien ─────────────────────────────────────────────
+    # ── Hebbian — interface simple (1 sample) ────────────────────────────
 
     @torch.no_grad()
     def hebbian_update(self, x: torch.Tensor, active: torch.Tensor) -> None:
         """
-        Met à jour les permanences synaptiques selon la règle hebbienne.
+        Met à jour les permanences hebbienement (1 sample).
 
-        Pour chaque colonne i ∈ A_t :
-            p_ij += δ⁺          si x_j = 1  (potentiation)
-            p_ij -= δ⁻·γ(t)     si x_j = 0  (dépression annealed)
-        Puis : p_ij ← clamp(p_ij, 0, 1)     (I2.2)
+        Délègue à hebbian_update_batch() pour cohérence.
+
+        Args:
+            x:      SDR binaire, shape (n_inputs,)
+            active: indices actifs, shape (k,)
+        """
+        self.hebbian_update_batch(x.unsqueeze(0), active.unsqueeze(0))
+
+    # ── Hebbian — interface batché (GPU-optimisé) ────────────────────────
+
+    @torch.no_grad()
+    def hebbian_update_batch(
+        self,
+        x_batch: torch.Tensor,
+        active_batch: torch.Tensor,
+    ) -> None:
+        """
+        Met à jour les permanences sur un batch — zéro boucle Python.
+
+        Formulation matricielle (GPU-friendly) :
+            active_oh[b,c] = 1  si colonne c active pour l'image b
+            n_active_cj   = active_oh.T @ x_batch     (C, n)
+            n_active_c    = active_oh.sum(0)           (C,)
+            Δp[c,j]       = n_active_cj·δ+ − (n_c − n_cj)·δ−(t)
+            Δp masqué par potential_mask, puis clamp [0,1]
 
         Invariant I2.2 : p_ij ∈ [0,1] après clamp.
         Réf. math : §2.5, Éq. 2.9.
 
         Args:
-            x:      SDR binaire, shape (n_inputs,)
-            active: indices des colonnes actives, shape (k,)
+            x_batch:      SDRs binaires, shape (B, n_inputs)
+            active_batch: indices actifs, shape (B, k)
         """
+        B = x_batch.shape[0]
         g = self.gamma()
-        delta_minus_t = self.delta_minus * g  # dépression annealed
+        delta_minus_t = self.delta_minus * g
 
-        # Masque des bits actifs / inactifs dans le SDR
-        x_on = x.bool()   # (n_inputs,) — bits = 1
-        x_off = ~x_on     # (n_inputs,) — bits = 0
+        # One-hot des colonnes actives : (B, C)
+        active_oh = torch.zeros(
+            B, self.n_columns,
+            dtype=torch.float,
+            device=x_batch.device,
+        )
+        active_oh.scatter_(1, active_batch, 1.0)
 
-        # Mise à jour uniquement pour les colonnes actives
-        perm_active = self.permanences.data[active]        # (k, n_inputs)
-        pool_active = self.potential_mask[active]           # (k, n_inputs)
+        # Accumulation des co-activations : (C, n_inputs)
+        # n_active_cj[c,j] = nombre de fois où col c active ET bit j = 1
+        n_active_cj = active_oh.T @ x_batch.float()      # matmul GPU-friendly
 
-        # Potentiation : bits SDR actifs ET dans le potential pool
-        perm_active[pool_active & x_on.unsqueeze(0).expand_as(pool_active)] += self.delta_plus
+        # Nombre total d'activations par colonne : (C,)
+        n_active_c = active_oh.sum(0)                     # (C,)
 
-        # Dépression : bits SDR inactifs ET dans le potential pool
-        perm_active[pool_active & x_off.unsqueeze(0).expand_as(pool_active)] -= delta_minus_t
+        # Δp = potentiation − dépression, masqué par le potential pool
+        delta = (
+            n_active_cj * self.delta_plus
+            - (n_active_c.unsqueeze(1) - n_active_cj) * delta_minus_t
+        ) * self.potential_mask_f                         # (C, n_inputs)
 
-        # Clamp I2.2 — uniquement dans le pool (hors pool reste à 0)
-        perm_active.clamp_(0.0, 1.0)
-        self.permanences.data[active] = perm_active
+        # Mise à jour et clamp I2.2
+        self.permanences.data.add_(delta).clamp_(0.0, 1.0)
 
-        # Mise à jour du duty cycle EMA
-        self._update_duty_cycle(active)
+        # Duty cycle EMA (fenêtre 1000 pas per-sample)
+        alpha = min(B / 1000.0, 0.5)
+        mean_activity = active_oh.mean(0)                 # (C,)
+        self.duty_cycle.data.mul_(1.0 - alpha).add_(alpha * mean_activity)
 
-        # Incrément du compteur de pas
-        self.t_step.data += 1
-
-    @torch.no_grad()
-    def _update_duty_cycle(self, active: torch.Tensor) -> None:
-        """
-        Met à jour le duty cycle EMA de chaque colonne.
-
-        EMA avec fenêtre glissante de 1000 pas (§2.6).
-
-        Args:
-            active: indices des colonnes actives au pas courant, shape (k,)
-        """
-        alpha = 1.0 / 1000.0
-        activity = torch.zeros(self.n_columns, device=self.duty_cycle.device)
-        activity[active] = 1.0
-        self.duty_cycle.data = (1.0 - alpha) * self.duty_cycle + alpha * activity
+        # Incrément compteur de pas
+        self.t_step.data += B
 
     # ── Utilitaires ───────────────────────────────────────────────────────
 
     def permanence_stats(self) -> dict:
-        """Retourne des statistiques sur les permanences (dans le potential pool uniquement)."""
-        p = self.permanences[self.potential_mask]   # 1D, seulement les synapses candidates
+        """Statistiques sur les permanences dans le potential pool."""
+        p = self.permanences[self.potential_mask]
         return {
             "min": p.min().item(),
             "max": p.max().item(),

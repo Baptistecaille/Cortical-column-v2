@@ -269,6 +269,60 @@ class CorticalColumn(nn.Module):
             "vote_stats": vote_stats,
         }
 
+    def step_batch(
+        self,
+        s_batch: torch.Tensor,
+        train: bool = True,
+    ) -> dict:
+        """
+        Entraînement batché — version GPU-optimisée de step().
+
+        Exécute SDRSpace + SpatialPooler en mode batch (matmuls vectorisés),
+        puis calcule le consensus par batch. Layer6b et GridCell (état séquentiel)
+        sont omis ici — utilisés uniquement lors de l'évaluation via step().
+
+        Adapté aux images statiques (MNIST) où la vitesse est nulle et
+        l'intégration de chemin n'est pas nécessaire à l'entraînement.
+
+        Args:
+            s_batch: stimuli sensoriels, shape (B, input_dim)
+            train:   si True, effectue l'apprentissage hebbien
+
+        Returns:
+            dict avec :
+                sdr_batch:       SDRs col. 0, shape (B, n_sdr)
+                consensus_batch: SDR de consensus AND, shape (B, n_sdr)
+                all_sdr_batches: liste des K tenseurs (B, n_sdr)
+        """
+        B = s_batch.shape[0]
+        all_sdr_batches = []
+
+        for col in self.columns:
+            # Module 1 — SDRSpace (batch natif)
+            sdr_batch = col.sdr_space.encode(s_batch)          # (B, n_sdr)
+
+            # Module 2 — SpatialPooler (batch, GPU-friendly)
+            active_batch = col.spatial_pooler.forward_batch(sdr_batch)  # (B, k)
+
+            if train:
+                col.spatial_pooler.hebbian_update_batch(sdr_batch, active_batch)
+
+            all_sdr_batches.append(sdr_batch)
+
+        # Module 6 — Consensus AND par batch
+        # sdr_stack : (K, B, n_sdr) → vote_fraction : (B, n_sdr)
+        sdr_stack = torch.stack(all_sdr_batches, dim=0).float()
+        vote_fraction = sdr_stack.mean(dim=0)
+        consensus_batch = (
+            vote_fraction >= self.consensus.consensus_threshold
+        ).float()
+
+        return {
+            "sdr_batch": all_sdr_batches[0],
+            "consensus_batch": consensus_batch,
+            "all_sdr_batches": all_sdr_batches,
+        }
+
     def reset(self) -> None:
         """Réinitialise l'état interne de toutes les colonnes (nouvel épisode)."""
         for col in self.columns:
