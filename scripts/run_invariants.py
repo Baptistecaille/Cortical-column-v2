@@ -160,9 +160,9 @@ def test_grid_cell(verbose: bool = False) -> bool:
     all_ok = True
 
     gc = GridCellNetwork(n_modules=6, periods=[3, 5, 7, 11, 13, 17])
-    allo = torch.randn(12) * 0.1
+    velocity = torch.randn(2) * 0.1
 
-    phases = gc.integrate(allo)
+    phases = gc.integrate(velocity)
 
     # I4.1 : φ_k ∈ [0, 2π)²
     in_range = ((phases >= 0) & (phases < 2 * math.pi)).all().item()

@@ -83,7 +83,6 @@ class SingleColumn(nn.Module):
         self.grid_cell = GridCellNetwork(
             n_modules=n_grid_modules,
             periods=grid_periods,
-            phase_dim_in=2 * n_grid_modules,
         )
 
     def step(
@@ -121,8 +120,8 @@ class SingleColumn(nn.Module):
         # Module 3 — Transformation ego→allo (I3.1)
         allo_phase = self.layer6b.transform(sdr_active_dense, v_t)  # (2·n_mod,)
 
-        # Module 4 — Intégration de chemin (I4.1, I4.2)
-        phase = self.grid_cell.integrate(allo_phase)        # (n_modules, 2)
+        # Module 4 — Intégration de chemin via vitesse directe (I4.1, I4.2)
+        phase = self.grid_cell.integrate(v_t)               # (n_modules, 2)
         grid_code = self.grid_cell.get_code()               # (4·n_modules,)
 
         # Apprentissage hebbien (I2.3) — @no_grad interne

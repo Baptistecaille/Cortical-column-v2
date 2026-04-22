@@ -8,14 +8,21 @@ Invariants :
            → dimension totale 4·n_modules (pas 2·n_modules)
     I4.3 : Correction anchor() pondérée par 1/λ_k (pas uniforme)
 
-Théorème CRT :
-    Les périodes λ_k doivent être copremières pour une résolution sans ambiguïté
-    sur ∏λ_k unités (§4.3, Thm 4.1).
+Règle d'intégration (pseudo-algo CLAUDE.md §3) :
+    φ_k ← (φ_k + R_k · v_t) mod 2π
+    où v_t est la VITESSE 2D directement (pas l'allo_phase de Layer6b).
+    R_k est une matrice de rotation 2×2 par module, scalée par 2π/λ_k.
 
-Pourquoi le tore :
-    La périodicité du signal de grid cell impose ℝ²/Λ ≅ 𝕋² — confirmé
-    empiriquement par Gardner et al. 2022 (homologie persistante sur
-    enregistrements de rat).
+Ancienne implémentation (bug) :
+    W_integrator apprenait à mapper allo_phase (12D) → delta_phi.
+    Initialisé orthogonalement, il produisait ~90° d'erreur aléatoire.
+    Fix : intégration directe de la vitesse via R_k analytique.
+
+Propriété de retour à l'origine :
+    Si ∑v_t = 0 sur un épisode (retour au point de départ),
+    alors ∑Δφ_k = R_k · ∑v_t = 0 → les phases reviennent exactement
+    à leur valeur initiale. L'anchor() ne corrige que la dérive de
+    bruit numérique (proche de 0).
 
 Réf. math : §4 — Formalisation_Mille_Cerveaux.pdf
 """
@@ -29,15 +36,7 @@ from functools import reduce
 
 
 def _are_coprime(periods: List[int]) -> bool:
-    """
-    Vérifie que les périodes sont copremières deux à deux (CRT).
-
-    Args:
-        periods: liste d'entiers représentant les périodes λ_k
-
-    Returns:
-        True si toutes les paires sont copremières
-    """
+    """Vérifie que les périodes sont copremières deux à deux (CRT)."""
     for i in range(len(periods)):
         for j in range(i + 1, len(periods)):
             if gcd(periods[i], periods[j]) != 1:
@@ -50,126 +49,111 @@ class GridCellNetwork(nn.Module):
     Réseau de cellules de grille pour l'intégration de chemin sur 𝕋².
 
     Chaque module k maintient une phase 2D φ_k ∈ [0, 2π)²
-    mise à jour par intégration de la vitesse allocentrique.
+    mise à jour directement par la vitesse 2D : φ_k ← φ_k + R_k · v_t.
+
+    R_k = (2π / λ_k) · I₂  : rotation isotropique scalée par la période.
+    Les modules à petite période (λ=3) ont une plus grande résolution spatiale
+    — ils détectent les petits déplacements avec plus de précision.
 
     Args:
-        n_modules:       nombre de modules de grid cells
-        periods:         liste d'entiers λ_k (périodes spatiales, copremières)
-        phase_dim_in:    dimension du vecteur de phase allocentrique entrant
-                         (= Layer6bTransformer.phase_dim = 2 × n_modules)
+        n_modules:  nombre de modules de grid cells
+        periods:    liste d'entiers λ_k (périodes spatiales, copremières)
+        velocity_scale: facteur de normalisation des vitesses entrantes.
+                    Doit correspondre au velocity_scale utilisé lors de la
+                    génération des épisodes (défaut 10.0 → v ∈ [-0.4, 0.4]).
     """
 
-    # Périodes canoniques copremières (suites de nombres premiers)
     DEFAULT_PERIODS = [3, 5, 7, 11, 13, 17, 19, 23]
 
     def __init__(
         self,
         n_modules: int = 6,
         periods: Optional[List[int]] = None,
-        phase_dim_in: Optional[int] = None,
+        velocity_scale: float = 10.0,
     ) -> None:
         super().__init__()
 
         self.n_modules = n_modules
+        self.velocity_scale = velocity_scale
 
-        # Périodes λ_k : copremières (Thm CRT)
         if periods is None:
             periods = self.DEFAULT_PERIODS[:n_modules]
-        assert len(periods) == n_modules, (
-            f"len(periods)={len(periods)} ≠ n_modules={n_modules}"
-        )
-        # Vérification coprimarité — piège CRT
+        assert len(periods) == n_modules
         assert _are_coprime(periods), (
             f"Les périodes {periods} ne sont pas copremières — viole le CRT (§4.3)"
         )
         self.periods = periods
 
-        # Phase λ_k comme buffer (float, en degrés d'arclength)
         lambda_k = torch.tensor(periods, dtype=torch.float)
         self.register_buffer("lambda_k", lambda_k)
 
         # ── Phases φ_k ∈ [0, 2π)² ────────────────────────────────────────
-        # Shape : (n_modules, 2) — une phase 2D par module
         phases = torch.rand(n_modules, 2) * 2 * math.pi
         self.register_buffer("phases", phases)
 
-        # ── Matrice d'intégration ─────────────────────────────────────────
-        # Transforme le vecteur allo en incrément de phase par module
-        phase_dim_in = phase_dim_in or (2 * n_modules)
-        self.W_integrator = nn.Linear(phase_dim_in, n_modules * 2, bias=False)
+        # ── Matrices de rotation R_k ──────────────────────────────────────
+        # R_k = (2π / λ_k) · I₂ : chaque module intègre la vitesse à sa
+        # propre résolution spatiale. Pas de paramètre appris — analytique.
+        # Shape : (n_modules,) — scalaire par module (isotropique)
+        scales = (2 * math.pi / lambda_k)   # (n_modules,)
+        self.register_buffer("R_k_scale", scales)
 
-        # Initialisation orthogonale pour stabilité
-        nn.init.orthogonal_(self.W_integrator.weight)
+    # ── Intégration de chemin (vitesse directe) ───────────────────────────
 
-    # ── Intégration de chemin ─────────────────────────────────────────────
-
+    @torch.no_grad()
     def integrate(
         self,
-        allo_phase: torch.Tensor,
+        velocity: torch.Tensor,
         dt: float = 1.0,
     ) -> torch.Tensor:
         """
-        Intègre la vitesse allocentrique pour mettre à jour les phases.
+        Intègre la vitesse 2D pour mettre à jour les phases sur 𝕋².
 
-        Pour chaque module k :
-            φ_k ← (φ_k + R_k · v_allo · dt) mod 2π
+        Règle : φ_k ← (φ_k + R_k · v_t · dt) mod 2π
+
+        Propriété de retour : si ∑v_t = 0 → ∑Δφ_k = 0 → phases exactes.
 
         Invariant I4.1 : φ_k ∈ [0, 2π)² après mod 2π.
 
         Réf. math : §4.2, Éq. 4.3.
 
         Args:
-            allo_phase: vecteur allocentrique de Layer6b, shape (2·n_modules,)
-            dt:         pas de temps (typiquement 1.0)
+            velocity: vecteur vitesse 2D (allocentrique ou egocentrique),
+                      shape (2,). Doit utiliser les mêmes unités que lors
+                      de la génération des épisodes.
+            dt:       pas de temps (typiquement 1.0)
 
         Returns:
-            phases: phases mises à jour, shape (n_modules, 2)
+            phases: shape (n_modules, 2)
         """
-        # Calcul des incréments de phase via la matrice d'intégration
-        delta_phi = self.W_integrator(allo_phase.float())   # (n_modules × 2,)
-        delta_phi = delta_phi.reshape(self.n_modules, 2)    # (n_modules, 2)
+        # delta_phi[k] = R_k_scale[k] * velocity, pour chaque module k
+        # shape : (n_modules, 2) = (n_modules, 1) * (1, 2)
+        delta_phi = self.R_k_scale.unsqueeze(1) * velocity.float().unsqueeze(0)
 
-        # Mise à jour sur le tore 𝕋² — mod 2π strict (I4.1)
         new_phases = (self.phases + dt * delta_phi) % (2 * math.pi)
         self.phases.data = new_phases
-
-        return self.phases  # (n_modules, 2)
+        return self.phases   # (n_modules, 2)
 
     # ── Code de position ──────────────────────────────────────────────────
 
+    @torch.no_grad()
     def get_code(self) -> torch.Tensor:
         """
-        Retourne le code de position via cos/sin de chaque axe de phase.
-
-        Pour chaque module k :
-            code_k = [cos(φ_k,0), sin(φ_k,0), cos(φ_k,1), sin(φ_k,1)]
-
-        Invariant I4.2 : dimension totale = 4 × n_modules (pas 2 × n_modules).
-
-        Réf. math : §4.4, Éq. 4.6.
-
-        Returns:
-            code: vecteur de position, shape (4 × n_modules,)
+        Code de position : [cos(φ_k,0), sin(φ_k,0), cos(φ_k,1), sin(φ_k,1)]
+        par module. Dimension = 4 × n_modules. Invariant I4.2.
         """
-        # φ_k,0 et φ_k,1 : les deux axes de chaque module
-        phi_0 = self.phases[:, 0]  # (n_modules,)
-        phi_1 = self.phases[:, 1]  # (n_modules,)
-
-        # 4 composantes par module — I4.2
+        phi_0 = self.phases[:, 0]
+        phi_1 = self.phases[:, 1]
         code = torch.stack(
-            [
-                torch.cos(phi_0),
-                torch.sin(phi_0),
-                torch.cos(phi_1),
-                torch.sin(phi_1),
-            ],
+            [torch.cos(phi_0), torch.sin(phi_0),
+             torch.cos(phi_1), torch.sin(phi_1)],
             dim=-1,
-        ).reshape(4 * self.n_modules)  # (4·n_modules,)
-
+        ).reshape(4 * self.n_modules)
         return code
 
     # ── Ancrage ───────────────────────────────────────────────────────────
 
+    @torch.no_grad()
     def anchor(
         self,
         landmark_phases: torch.Tensor,
@@ -178,16 +162,19 @@ class GridCellNetwork(nn.Module):
         """
         Corrige les phases par ancrage sur un repère visuel.
 
-        La correction est pondérée par 1/λ_k — les modules à haute résolution
-        (petite période) ont une correction plus forte.
+        Pondéré par 1/λ_k (I4.3) — les modules haute résolution
+        (petite période) reçoivent une correction plus forte.
 
-        Invariant I4.3 : correction pondérée par 1/λ_k (pas uniforme).
+        Avec l'intégration directe de la vitesse, l'erreur résiduelle
+        sur un épisode bien formé est proche de 0 (dérive numérique).
+        anchor() corrige néanmoins pour les épisodes avec bruit ou
+        erreurs d'arrondi dans les translations.
 
         Réf. math : §4.5, Éq. 4.8.
 
         Args:
-            landmark_phases: phases cibles de référence, shape (n_modules, 2)
-            confidence:      confiance dans le repère (0=aucune, 1=totale)
+            landmark_phases: phases cibles, shape (n_modules, 2)
+            confidence:      confiance dans le repère ∈ [0, 1]
         """
         if landmark_phases.shape != self.phases.shape:
             raise ValueError(
@@ -195,34 +182,37 @@ class GridCellNetwork(nn.Module):
                 f"phases.shape={self.phases.shape}"
             )
 
-        # Poids de correction : 1/λ_k (I4.3) — modules haute-résolution prioritaires
-        weights = (1.0 / self.lambda_k).unsqueeze(-1)  # (n_modules, 1)
-        weights = weights / weights.sum()               # normalisation
+        weights = (1.0 / self.lambda_k).unsqueeze(-1)   # (n_modules, 1)
+        weights = weights / weights.sum()
 
-        # Erreur angulaire (sur le tore)
         delta = (landmark_phases - self.phases + math.pi) % (2 * math.pi) - math.pi
-
-        # Correction pondérée et ancrée par la confiance
         correction = confidence * weights * delta
-        corrected = (self.phases + correction) % (2 * math.pi)
-        self.phases.data = corrected
+        self.phases.data = (self.phases + correction) % (2 * math.pi)
 
     # ── Utilitaires ───────────────────────────────────────────────────────
 
+    @torch.no_grad()
     def reset(self) -> None:
-        """Réinitialise les phases à des valeurs aléatoires (nouvel épisode)."""
+        """Réinitialise les phases aléatoirement (nouvel épisode)."""
         self.phases.data = torch.rand_like(self.phases) * 2 * math.pi
 
-    def position_capacity(self) -> int:
-        """
-        Retourne la capacité de résolution de position (produit des périodes).
+    @torch.no_grad()
+    def reset_to(self, phases: torch.Tensor) -> None:
+        """Fixe les phases à une valeur donnée (reprise d'épisode)."""
+        self.phases.data = phases.to(self.phases.device).clone()
 
-        Grâce au CRT, la position est unique sur ∏λ_k unités.
-        """
+    def position_capacity(self) -> int:
+        """Capacité de résolution = ∏λ_k (Thm CRT)."""
         return reduce(lambda a, b: a * b, self.periods)
+
+    def path_error_deg(self, target_phases: torch.Tensor) -> float:
+        """Erreur angulaire moyenne entre phases courantes et cibles (°)."""
+        diff = (self.phases.cpu() - target_phases + math.pi) % (2 * math.pi) - math.pi
+        return math.degrees(diff.abs().mean().item())
 
     def extra_repr(self) -> str:
         return (
             f"n_modules={self.n_modules}, periods={self.periods}, "
-            f"capacity={self.position_capacity()}"
+            f"capacity={self.position_capacity()}, "
+            f"velocity_scale={self.velocity_scale}"
         )
