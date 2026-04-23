@@ -248,6 +248,10 @@ def train_multiview(
         "step": [],
     }
 
+    # Moyenne glissante view_overlap sur fenêtre 100 images
+    _overlap_window: List[float] = []
+    _overlap_window_size = 100
+
     t0 = time.perf_counter()
     images_processed = 0
 
@@ -290,6 +294,11 @@ def train_multiview(
                 result = model.step(s_t, v_t, train=True)
                 if should_log:
                     sdrs_in_episode.append(result["sdr"].cpu())
+                # Densité du vote (disponible à chaque pas si enable_vote)
+                _vote_density = (
+                    result["vote_sdr"].mean().item()
+                    if result.get("vote_sdr") is not None else 0.0
+                )
 
                 # Enregistrer les phases à la vue de retour (position ≈ 0)
                 is_return = (view_i == episode.views.shape[0] - 1)
@@ -317,6 +326,12 @@ def train_multiview(
                 else:
                     overlap = 0.0
 
+                # Moyenne glissante sur 100 images
+                _overlap_window.append(overlap)
+                if len(_overlap_window) > _overlap_window_size:
+                    _overlap_window.pop(0)
+                overlap_smooth = sum(_overlap_window) / len(_overlap_window)
+
                 # Cohérence des grid codes entre vue 0 et vue retour
                 if len(phases_at_origin) >= 2:
                     p0 = phases_at_origin[0]
@@ -338,14 +353,19 @@ def train_multiview(
                 history["anchor_error_deg"].append(err_deg)
                 history["step"].append(images_processed)
 
+                vote_str = (
+                    f" | vote_dens={_vote_density:.4f}"
+                    if model.enable_vote else ""
+                )
                 logger.info(
                     f"Epoch {epoch+1} | Image {idx_in_epoch+1:5d}/{N} | "
                     f"{ips:5.0f} img/s | "
                     f"γ={gamma:.3f} | "
                     f"p̄={stats['mean']:.3f} | "
-                    f"view_overlap={overlap:.3f} | "
+                    f"overlap={overlap_smooth:.3f}(~100) | "
                     f"grid_err={err_deg:.1f}° | "
                     f"grid_cos={cos_sim:.3f}"
+                    f"{vote_str}"
                 )
 
     return history
@@ -571,6 +591,12 @@ def main() -> None:
     parser.add_argument("--velocity_noise_px", type=float, default=0.3,
                         help="Bruit additif sur les vitesses en pixels (0=désactivé). "
                              "0.3 donne grid_err ~3-8° — thermomètre d'intégration actif.")
+    parser.add_argument("--enable_vote",   action="store_true",
+                        help="Active le vote inter-colonnes CMP (Phase 2). "
+                             "Force la convergence des SDRs via hebbian_update_targeted.")
+    parser.add_argument("--alpha_divergence", type=float, default=3.0,
+                        help="Pénalité de dépression sur les bits divergents du vote "
+                             "(défaut 3.0). Trop fort → collapse inter-colonnes.")
     parser.add_argument("--device",        type=str,   default="auto")
     parser.add_argument("--data_dir",      type=str,   default="./data")
     parser.add_argument("--verbose", "-v", action="store_true")
@@ -604,6 +630,8 @@ def main() -> None:
         k_active=args.k_active,
         n_grid_modules=args.n_grid_modules,
         grid_periods=grid_periods,
+        enable_vote=args.enable_vote,
+        alpha_divergence=args.alpha_divergence,
         sp_kwargs={
             "newborn_steps": newborn_steps,
             "tau_decay":     tau_decay,

@@ -356,6 +356,90 @@ class SpatialPooler(nn.Module):
         # Incrément compteur de pas
         self.t_step.data += B
 
+    # ── Hebbian ciblé — vote inter-colonnes (Phase 2) ───────────────────
+
+    @torch.no_grad()
+    def hebbian_update_targeted(
+        self,
+        x: torch.Tensor,
+        active: torch.Tensor,
+        vote_sdr: torch.Tensor,
+        alpha_divergence: float = 3.0,
+    ) -> None:
+        """
+        Mise à jour hebbienne modulée par le vote inter-colonnes (Phase 2).
+
+        Principe CMP (Monty/Thousand Brains) :
+            Le vote agrégé des K colonnes sert de cible pour la colonne courante.
+            Les bits actifs qui sont dans le vote sont potentialisés normalement.
+            Les bits actifs qui divergent du vote sont déprimés plus fortement
+            (facteur alpha_divergence), ce qui pousse les colonnes à converger.
+
+        Règle :
+            active ∩ vote  → Δp = +δ⁺               (accord — LTP normal)
+            active \ vote  → Δp = −α · δ⁻(t)         (désaccord — LTD renforcé)
+            vote \ active  → Δp = 0                   (le boost s'en charge)
+
+        Invariant I6.1 respecté : les permanences restent propres à chaque
+        colonne, seule la force de la dépression est modulée.
+        Invariant I2.2 : p_ij ∈ [0,1] après clamp.
+
+        Args:
+            x:                SDR binaire, shape (n_inputs,)
+            active:           indices actifs SP, shape (k,)
+            vote_sdr:         SDR de vote agrégé, shape (n_inputs,) — binaire
+            alpha_divergence: facteur multiplicatif de dépression sur les bits
+                              divergents (défaut 3.0). Trop fort → collapse.
+        """
+        g = self._gamma_tensor()
+        delta_minus_t = self.delta_minus_floor + (
+            self.delta_minus - self.delta_minus_floor
+        ) * g
+
+        # One-hot de la colonne active : (n_columns,)
+        active_oh = torch.zeros(
+            self.n_columns, dtype=torch.float, device=x.device
+        )
+        active_oh.scatter_(0, active, 1.0)           # (n_columns,)
+
+        # Masques accord / désaccord sur les bits d'entrée
+        # active_dense[j] = 1 si le bit j est actif dans le SDR d'entrée
+        active_dense = torch.zeros(self.n_inputs, dtype=torch.float, device=x.device)
+        active_dense[active] = 1.0                   # reconstruction dense (k bits)
+
+        vote_f = vote_sdr.float()                    # (n_inputs,) binaire
+
+        # Pour chaque minicolonne c active, calculer les deltas différenciés.
+        # n_active_cj[c,j] = active_oh[c] * x[j]  (co-activations)
+        n_active_cj = torch.outer(active_oh, x.float())    # (n_columns, n_inputs)
+        n_active_c  = active_oh                             # (n_columns,)
+
+        # Δp standard (accord avec vote ou bits inactifs non-vote)
+        delta_std = (
+            n_active_cj * self.delta_plus
+            - (n_active_c.unsqueeze(1) - n_active_cj) * delta_minus_t
+        )
+
+        # Pénalité supplémentaire sur les bits actifs qui divergent du vote :
+        # diverge[j] = 1 si bit j actif dans x MAIS absent du vote
+        diverge = (x.float() - vote_f).clamp(min=0.0)  # (n_inputs,) ∈ {0,1}
+        # Appliquée uniquement aux minicolonnes actives
+        delta_diverge = (
+            -alpha_divergence * delta_minus_t
+            * n_active_c.unsqueeze(1)                  # (n_columns, 1) — actives seult
+            * diverge.unsqueeze(0)                     # (1, n_inputs)
+        )
+
+        delta = (delta_std + delta_diverge) * self.potential_mask_f
+        self.permanences.data.add_(delta).clamp_(0.0, 1.0)
+
+        # Duty cycle EMA
+        alpha_ema = 1.0 / 1000.0
+        self.duty_cycle.data.mul_(1.0 - alpha_ema).add_(alpha_ema * active_oh)
+
+        # Incrément compteur
+        self.t_step.data += 1
+
     # ── Utilitaires ───────────────────────────────────────────────────────
 
     def permanence_stats(self) -> dict:

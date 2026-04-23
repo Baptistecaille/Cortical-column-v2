@@ -155,11 +155,11 @@ class SingleColumn(nn.Module):
             self.sdr_space.pe_update(delta_W)
 
         return {
-            "sdr": sdr,
-            "active": active,
+            "sdr":        sdr,
+            "active":     active,
             "allo_phase": allo_phase,
-            "phase": phase,
-            "grid_code": grid_code,
+            "phase":      phase,
+            "grid_code":  grid_code,
         }
 
 
@@ -171,18 +171,22 @@ class CorticalColumn(nn.Module):
     paramètres — pas de weight sharing (I6.1).
 
     Le consensus est calculé par intersection (AND) des SDRs (I6.2).
+    Le vote inter-colonnes (Phase 2, CMP) module l'apprentissage hebbien
+    pour forcer la convergence des représentations sans weight sharing.
 
     Args:
-        n_columns:      nombre de colonnes K (typiquement 4–8)
-        input_dim:      dimension sensorielle brute
-        n_sdr:          dimension du SDR par colonne
-        w:              parcimonie du SDR
-        n_minicolumns:  nombre de minicolonnes par colonne
-        k_active:       colonnes actives par pas
-        n_grid_modules: modules de grid cells par colonne
-        grid_periods:   périodes λ_k
+        n_columns:        nombre de colonnes K (typiquement 4–8)
+        input_dim:        dimension sensorielle brute
+        n_sdr:            dimension du SDR par colonne
+        w:                parcimonie du SDR
+        n_minicolumns:    nombre de minicolonnes par colonne
+        k_active:         colonnes actives par pas
+        n_grid_modules:   modules de grid cells par colonne
+        grid_periods:     périodes λ_k
         consensus_threshold: seuil de vote (1.0 = AND strict, I6.3)
-        sp_kwargs:      arguments supplémentaires pour SpatialPooler
+        enable_vote:      active le vote inter-colonnes (Phase 2 CMP)
+        alpha_divergence: pénalité de dépression sur les bits divergents du vote
+        sp_kwargs:        arguments supplémentaires pour SpatialPooler
     """
 
     def __init__(
@@ -196,6 +200,8 @@ class CorticalColumn(nn.Module):
         n_grid_modules: int = 6,
         grid_periods: Optional[List[int]] = None,
         consensus_threshold: float = 1.0,
+        enable_vote: bool = False,
+        alpha_divergence: float = 3.0,
         pe_lr: float = 0.001,
         pe_lr_pred: float = 0.01,
         sp_kwargs: Optional[dict] = None,
@@ -205,6 +211,9 @@ class CorticalColumn(nn.Module):
         self.n_columns = n_columns
         self.n_sdr = n_sdr
         self.n_grid_modules = n_grid_modules
+        self.w = w
+        self.enable_vote = enable_vote
+        self.alpha_divergence = alpha_divergence
 
         # K colonnes INDÉPENDANTES — pas de weight sharing (I6.1)
         self.columns = nn.ModuleList([
@@ -231,6 +240,62 @@ class CorticalColumn(nn.Module):
             n_sdr=n_sdr,
             consensus_threshold=consensus_threshold,
         )
+
+    @torch.no_grad()
+    def _cross_column_vote(
+        self,
+        all_sdrs: List[torch.Tensor],
+        all_grid_codes: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Vote inter-colonnes pondéré par la cohérence de pose (Phase 2 CMP).
+
+        Protocole :
+            1. Calcule le grid_code moyen (référence de pose)
+            2. Pondère chaque colonne par cos_sim(grid_code_c, grid_code_mean)
+            3. Somme pondérée des SDRs → top-w strict → SDR binaire de vote
+
+        La pondération par cosinus sur le grid_code (vecteur cos/sin 24D)
+        donne plus de poids aux colonnes dont la pose est cohérente avec
+        le consensus spatial courant.
+
+        Args:
+            all_sdrs:        liste de K tenseurs (n_sdr,) — SDRs binaires
+            all_grid_codes:  liste de K tenseurs (4·n_modules,) — codes de pose
+
+        Returns:
+            vote_sdr: SDR binaire de vote, shape (n_sdr,), ||vote||₁ = w
+        """
+        K = len(all_sdrs)
+        device = all_sdrs[0].device
+
+        # Grid codes empilés : (K, 4·n_modules)
+        gc_stack = torch.stack(all_grid_codes, dim=0).float()   # (K, D_gc)
+
+        # Pose de référence = moyenne normalisée
+        gc_mean = gc_stack.mean(dim=0)                           # (D_gc,)
+        gc_mean_norm = gc_mean / (gc_mean.norm() + 1e-8)
+
+        # Similarité cosinus de chaque colonne avec la pose moyenne
+        gc_norms = gc_stack.norm(dim=1, keepdim=True) + 1e-8    # (K, 1)
+        gc_normalized = gc_stack / gc_norms                     # (K, D_gc)
+        cos_weights = (gc_normalized @ gc_mean_norm).clamp(min=0.0)  # (K,)
+
+        # Si toutes les poses sont orthogonales (cos=0), poids uniformes
+        if cos_weights.sum() < 1e-8:
+            cos_weights = torch.ones(K, device=device)
+        cos_weights = cos_weights / cos_weights.sum()           # normalisation
+
+        # Somme pondérée des SDRs : (n_sdr,)
+        sdr_stack = torch.stack(all_sdrs, dim=0).float()        # (K, n_sdr)
+        vote_scores = (cos_weights.unsqueeze(1) * sdr_stack).sum(dim=0)  # (n_sdr,)
+
+        # Top-w strict → SDR binaire (parcimonie dure, invariant I1.1)
+        _, top_idx = torch.topk(vote_scores, self.w, sorted=False)
+        vote_sdr = torch.zeros(self.n_sdr, device=device)
+        vote_sdr[top_idx] = 1.0
+
+        return vote_sdr
 
     def step(
         self,
@@ -264,6 +329,7 @@ class CorticalColumn(nn.Module):
         all_phases = []
         all_grid_codes = []
         all_allo_phases = []
+        all_actives = []
 
         # ── Étapes 1–4 pour chaque colonne ───────────────────────────────
         for col in self.columns:
@@ -272,6 +338,25 @@ class CorticalColumn(nn.Module):
             all_phases.append(result["phase"])
             all_grid_codes.append(result["grid_code"])
             all_allo_phases.append(result["allo_phase"])
+            all_actives.append(result["active"])
+
+        # ── Vote inter-colonnes (Phase 2 CMP) ────────────────────────────
+        vote_sdr = None
+        if train and self.enable_vote and self.n_columns > 1:
+            vote_sdr = self._cross_column_vote(all_sdrs, all_grid_codes)
+            # Mise à jour hebbienne ciblée : remplace l'update standard déjà
+            # effectué dans col.step() — on re-applique avec la cible de vote.
+            # Note : col.step(train=True) a déjà incrémenté t_step via
+            # hebbian_update(). On applique l'update ciblé en PLUS, avec
+            # un learning rate réduit (delta implicitement plus petit via
+            # alpha_divergence uniquement sur les bits divergents).
+            for c, col in enumerate(self.columns):
+                col.spatial_pooler.hebbian_update_targeted(
+                    x=all_sdrs[c],
+                    active=all_actives[c],
+                    vote_sdr=vote_sdr,
+                    alpha_divergence=self.alpha_divergence,
+                )
 
         # ── Module 5 — Algèbre de déplacement ────────────────────────────
         # Calculé sur la première colonne (référence)
@@ -296,6 +381,7 @@ class CorticalColumn(nn.Module):
             "all_phases": all_phases,
             "all_grid_codes": all_grid_codes,
             "vote_stats": vote_stats,
+            "vote_sdr": vote_sdr,   # None si enable_vote=False
         }
 
     def step_batch(
