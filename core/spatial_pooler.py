@@ -118,15 +118,16 @@ class SpatialPooler(nn.Module):
 
         # ── Permanences synaptiques ──────────────────────────────────────
         # p_ij ∈ [0,1], shape (n_columns, n_inputs)
-        # Uniforme(0.3, 0.7) — jamais torch.randn (I2.2)
-        # Les permanences hors potential pool restent à 0 (non utilisées).
-        # Uniforme(0.20, 0.24) — légèrement sous connected_perm=0.20 + marge.
-        # Démarre en zone sub-threshold pour que la potentiation hebbienne
-        # décide quelles synapses franchissent le seuil (convergence propre).
+        # Uniforme(0.10, 0.30) centré sur connected_perm=0.20 :
+        #   - 50% des synapses démarrent connectées (> 0.20)
+        #   - 50% démarrent sub-threshold
+        # Permet à la potentiation hebbienne de différencier les synapses
+        # actives (qui franchissent 0.20) des inactives (qui restent dessous).
+        # Bug résolu : uniform(0.20, 0.24) → tout connecté dès t=0 → p_conn=1.0
         permanences = torch.zeros(n_columns, n_inputs)
         permanences[potential_mask] = torch.empty(
             potential_mask.sum().item()
-        ).uniform_(0.20, 0.24)
+        ).uniform_(0.10, 0.30)
         self.register_buffer("permanences", permanences)
 
         # ── Vérification de l'équilibre δ+/δ− ────────────────────────────
@@ -377,8 +378,8 @@ class SpatialPooler(nn.Module):
 
         Règle :
             active ∩ vote  → Δp = +δ⁺               (accord — LTP normal)
-            active \ vote  → Δp = −α · δ⁻(t)         (désaccord — LTD renforcé)
-            vote \ active  → Δp = 0                   (le boost s'en charge)
+            active - vote  → Δp = -α · δ⁻(t)         (désaccord — LTD renforcé)
+            vote - active  → Δp = 0                   (le boost s'en charge)
 
         Invariant I6.1 respecté : les permanences restent propres à chaque
         colonne, seule la force de la dépression est modulée.

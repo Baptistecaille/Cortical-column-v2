@@ -221,6 +221,11 @@ def main() -> None:
     args = parser.parse_args()
 
     # Construction du modèle
+    # consensus_threshold=0.75 : 3 colonnes sur 4 doivent s'accorder.
+    # AND strict (1.0) est mathématiquement vide pour n=512, w=20, K=4 :
+    #   P(bit commun 4 colonnes) = (20/512)^4 ≈ 10^{-7} → 0 bit en moyenne.
+    # 0.75 reste biologiquement fidèle à Thousand Brains (vote majoritaire)
+    # et donne ~0.05 bits attendus → consensus non-vide mesurable.
     model = CorticalColumn(
         n_columns=args.n_columns,
         input_dim=args.input_dim,
@@ -230,7 +235,7 @@ def main() -> None:
         k_active=args.k_active,
         n_grid_modules=args.n_grid_modules,
         grid_periods=[3, 5, 7, 11][:args.n_grid_modules],
-        consensus_threshold=1.0,
+        consensus_threshold=0.75,
     )
 
     logger.info(f"Modèle : {model.n_columns} colonnes × {args.n_minicolumns} minicolonnes")

@@ -69,9 +69,14 @@ class PECircuits(nn.Module):
         # Prédicteur top-down : context → SDR attendu
         # Stocké comme nn.Linear pour compatibilité device/state_dict,
         # mais mis à jour exclusivement par règle delta (@no_grad).
+        # Initialisation Xavier (pas zéro) : W=0 → predicted=0 → PE+=sdr,
+        # PE-=0 toujours → signal d'erreur asymétrique dès t=0, mais le
+        # filtre tau=10 lisse tout à ~0 → W_pred ne bouge jamais.
+        # Xavier donne une prédiction initiale non nulle et variée → PE+/PE-
+        # équilibrés → signal d'apprentissage effectif dès les premiers pas.
         self.predictor = nn.Linear(self.context_dim, dim, bias=True)
         with torch.no_grad():
-            nn.init.zeros_(self.predictor.weight)
+            nn.init.xavier_uniform_(self.predictor.weight)
             nn.init.zeros_(self.predictor.bias)
 
         # États des populations PE+/PE− (filtres passe-bas)
