@@ -1,15 +1,16 @@
 """
-Pipeline d'évaluation non-supervisée — 6 métriques.
+Pipeline d'évaluation non-supervisée — 7 métriques.
 
 Métriques :
-    ε        : erreur de reconstruction (fidélité SDR)
-    sparsity : parcimonie L2/3 (doit respecter le seuil sur t_max)
-    var_red  : réduction de variance par le vote inter-colonnes
-    lin_prob : précision de sondage linéaire (linear probing)
-    nmi      : NMI k-means sur les représentations
-    SI       : indice de spécialisation des colonnes
+    ε            : erreur de reconstruction (fidélité SDR)
+    sparsity     : parcimonie L2/3 (doit respecter le seuil sur t_max)
+    var_red      : réduction de variance par le vote inter-colonnes
+    lin_prob     : précision de sondage linéaire (linear probing)
+    nmi          : NMI k-means sur les représentations
+    SI           : indice de spécialisation des colonnes
+    pred_success : taux de succès des prédictions (predictive coding)
 
-Ces 6 métriques correspondent à l'évaluation non-supervisée définie dans
+Ces 7 métriques correspondent à l'évaluation non-supervisée définie dans
 CLAUDE.md §3 et le pseudo-algorithme global.
 
 Réf. math : §8 — Formalisation_Mille_Cerveaux.pdf
@@ -197,6 +198,106 @@ def compute_nmi(
     return float(nmi)
 
 
+def prediction_success_rate(
+    sdr_predicted: torch.Tensor,
+    sdr_observed: torch.Tensor,
+    threshold: float = 0.5,
+) -> dict:
+    """
+    Calcule le taux de succès de la prédiction du prochain SDR.
+
+    La prédiction est considérée comme un succès si le chevauchement
+    (overlap) entre le SDR prédit et le SDR réellement observé
+    dépasse le seuil `threshold`.
+
+    overlap = |SDR_pred ∩ SDR_obs| / w
+    succès  = overlap >= threshold
+
+    Connexion biologique : correspond au signal de prédiction descendant
+    (L6 → L4) dans le cadre du predictive coding (Rao-Ballard 1999).
+    Un overlap élevé signifie que la colonne anticipait correctement
+    l'entrée sensorielle avant de la recevoir.
+
+    Réf. math : §8.7, Éq. 8.7.
+
+    Args:
+        sdr_predicted: SDR prédit pour le prochain pas, shape (n,), binaire
+        sdr_observed:  SDR réellement observé,          shape (n,), binaire
+        threshold:     seuil d'overlap pour considérer la prédiction
+                       comme un succès (défaut 0.5 = 50% des bits corrects)
+
+    Returns:
+        dict avec :
+            overlap:  fraction de bits prédits corrects ∈ [0, 1]
+            success:  True si overlap >= threshold
+            precision: |pred ∩ obs| / |pred| (évite les fausses alarmes)
+            recall:    |pred ∩ obs| / |obs|  (= overlap si |pred|=|obs|=w)
+    """
+    w_obs = sdr_observed.sum().item()
+    w_pred = sdr_predicted.sum().item()
+
+    if w_obs == 0 or w_pred == 0:
+        return {
+            "overlap": 0.0,
+            "success": False,
+            "precision": 0.0,
+            "recall": 0.0,
+        }
+
+    intersection = (sdr_predicted * sdr_observed).sum().item()
+    overlap = intersection / w_obs
+    precision = intersection / w_pred
+    recall = intersection / w_obs
+
+    return {
+        "overlap": float(overlap),
+        "success": overlap >= threshold,
+        "precision": float(precision),
+        "recall": float(recall),
+    }
+
+
+def batch_prediction_success_rate(
+    sdrs_predicted: List[torch.Tensor],
+    sdrs_observed: List[torch.Tensor],
+    threshold: float = 0.5,
+) -> dict:
+    """
+    Calcule le taux de succès agrégé sur une séquence de prédictions.
+
+    Pour une séquence de N pas, compare chaque SDR prédit au pas t
+    avec le SDR observé au pas t+1 (convention causale standard).
+
+    Args:
+        sdrs_predicted: liste de N SDRs prédits, chacun shape (n,)
+        sdrs_observed:  liste de N SDRs observés, chacun shape (n,)
+        threshold:      seuil de succès (défaut 0.5)
+
+    Returns:
+        dict avec :
+            pred_success_rate : fraction de prédictions réussies ∈ [0, 1]
+            mean_overlap      : overlap moyen sur tous les pas
+            mean_precision    : précision moyenne
+            mean_recall       : rappel moyen
+    """
+    assert len(sdrs_predicted) == len(sdrs_observed), (
+        "sdrs_predicted et sdrs_observed doivent avoir la même longueur"
+    )
+
+    results = [
+        prediction_success_rate(p, o, threshold)
+        for p, o in zip(sdrs_predicted, sdrs_observed)
+    ]
+
+    n = len(results)
+    return {
+        "pred_success_rate": float(sum(r["success"] for r in results) / n),
+        "mean_overlap":      float(sum(r["overlap"] for r in results) / n),
+        "mean_precision":    float(sum(r["precision"] for r in results) / n),
+        "mean_recall":       float(sum(r["recall"] for r in results) / n),
+    }
+
+
 def column_specialization_index(
     sdrs_per_column: List[List[torch.Tensor]],
 ) -> float:
@@ -256,11 +357,30 @@ def column_specialization_index(
 
 class UnsupervisedEvaluator:
     """
-    Pipeline d'évaluation complet — 6 métriques non-supervisées.
+    Pipeline d'évaluation complet — 7 métriques non-supervisées.
+
+    Métriques retournées par evaluate() :
+        epsilon              : erreur de reconstruction SDR ∈ [0, 1]
+        sparsity_violation_rate : fraction de pas violant I1.1 ∈ [0, 1]
+        var_red              : réduction de variance du consensus ∈ [0, 1]
+        lin_prob             : précision du sondage linéaire ∈ [0, 1]
+        nmi                  : NMI k-means ∈ [0, 1]
+        SI                   : indice de spécialisation ∈ [0, 1]
+        pred_success_rate    : taux de prédictions réussies ∈ [0, 1]
+        pred_mean_overlap    : overlap moyen prédit/observé ∈ [0, 1]
+        pred_precision       : précision des prédictions ∈ [0, 1]
+        pred_recall          : rappel des prédictions ∈ [0, 1]
+
+    Note sur pred_success_rate :
+        Si result["sdr_predicted"] est exposé par CorticalColumn.step(),
+        on compare le SDR prédit explicite au SDR observé — c'est la vraie
+        métrique predictive coding (Rao-Ballard).
+        Sinon, on utilise SDR(t) comme proxy pour SDR(t+1) — mesure de
+        cohérence séquentielle minimale.
 
     Usage :
         evaluator = UnsupervisedEvaluator(model, expected_w=40)
-        metrics = evaluator.evaluate(dataloader)
+        metrics = evaluator.evaluate(inputs, velocities, labels)
     """
 
     def __init__(
@@ -299,6 +419,11 @@ class UnsupervisedEvaluator:
         variance_reductions = []
         sparsity_violations = 0
 
+        # Prédiction : SDR prédit au pas t comparé au SDR observé au pas t+1
+        # (convention causale : la colonne prédit avant de recevoir l'entrée)
+        sdrs_predicted_seq: List[torch.Tensor] = []
+        sdrs_observed_seq: List[torch.Tensor] = []
+
         self.model.reset()
 
         for t in range(N):
@@ -320,6 +445,13 @@ class UnsupervisedEvaluator:
                 vote_variance_reduction(result["all_sdrs"], consensus)
             )
 
+            # pred_success — collecte prédiction si disponible dans result
+            # result["sdr_predicted"] est le SDR que le modèle prédit
+            # pour le prochain pas (calculé par L6b avant réception de t+1)
+            if "sdr_predicted" in result:
+                sdrs_predicted_seq.append(result["sdr_predicted"])
+                sdrs_observed_seq.append(sdr)
+
             # Collecte des représentations
             all_sdrs.append(sdr)
             all_grid_codes.append(result["all_grid_codes"][0])
@@ -332,6 +464,34 @@ class UnsupervisedEvaluator:
             "sparsity_violation_rate": float(sparsity_violations / N),
             "var_red": float(sum(variance_reductions) / N),
         }
+
+        # pred_success — taux de succès des prédictions (predictive coding)
+        # Si le modèle ne fournit pas encore "sdr_predicted", on aligne
+        # les SDRs consécutifs pour mesurer la cohérence temporelle :
+        # dans quelle mesure le SDR au pas t prédit le SDR au pas t+1.
+        if sdrs_predicted_seq:
+            # Cas nominal : le modèle expose ses prédictions explicites
+            pred_stats = batch_prediction_success_rate(
+                sdrs_predicted_seq, sdrs_observed_seq
+            )
+        elif len(all_sdrs) >= 2:
+            # Cas dégradé : on utilise SDR(t) comme proxy de prédiction
+            # pour SDR(t+1) — mesure la cohérence séquentielle minimale
+            pred_stats = batch_prediction_success_rate(
+                all_sdrs[:-1], all_sdrs[1:]
+            )
+        else:
+            pred_stats = {
+                "pred_success_rate": float("nan"),
+                "mean_overlap": float("nan"),
+                "mean_precision": float("nan"),
+                "mean_recall": float("nan"),
+            }
+
+        metrics["pred_success_rate"] = pred_stats["pred_success_rate"]
+        metrics["pred_mean_overlap"] = pred_stats["mean_overlap"]
+        metrics["pred_precision"] = pred_stats["mean_precision"]
+        metrics["pred_recall"] = pred_stats["mean_recall"]
 
         # lin_prob et nmi — nécessitent des étiquettes
         if labels is not None:
