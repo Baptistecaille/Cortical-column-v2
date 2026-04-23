@@ -31,27 +31,34 @@ class SingleColumn(nn.Module):
     """
     Une colonne corticale indépendante avec ses 5 modules propres.
 
-    Chaque colonne possède ses propres permanences, grid cells et
-    transformateur L6b — pas de partage de poids avec les autres colonnes.
+    Chaque colonne possède ses propres permanences SP, grid cells et
+    transformateur L6b — pas de partage de poids au sens de I6.1.
 
-    Prédiction causal (predictive coding) :
+    Note sur SDRSpace (encodeur L4) :
+        SDRSpace peut être partagé entre colonnes (shared_sdr_space).
+        Biologiquement, L4 reçoit l'entrée thalamique commune ; ce sont
+        les minicolonnes L2/3 (SpatialPooler) qui sont spécialisées.
+        I6.1 concerne les permanences SP, pas la projection sensorielle.
+        Sans encodeur partagé, les colonnes projettent le même stimulus
+        dans des espaces orthogonaux → overlap structurel ~0 → consensus
+        vide quelle que soit la durée d'entraînement.
+
+    Prédiction causale (predictive coding) :
         À chaque pas t, AVANT d'encoder s_t, la colonne génère un SDR prédit
         à partir du grid_code mémorisé au pas précédent :
             sdr_predicted = binarize_topk(W_pred · grid_code_{t-1}, w)
-        Ce SDR est comparé au SDR observé sdr_t pour calculer le taux
-        de succès prédictif (métrique pred_success_rate).
-        Le prédicteur W_pred est le même que celui de pe_circuits (Lee 2025) —
-        pas de module supplémentaire.
+        Le prédicteur W_pred est celui de pe_circuits (Lee 2025).
 
     Args:
-        input_dim:      dimension sensorielle brute
-        n_sdr:          dimension du SDR (SDRSpace.n)
-        w:              parcimonie du SDR (SDRSpace.w)
-        n_minicolumns:  nombre de minicolonnes (SpatialPooler.n_columns)
-        k_active:       colonnes actives dans SpatialPooler (I2.1)
-        n_grid_modules: nombre de modules de grid cells (GridCellNetwork)
-        grid_periods:   périodes λ_k (copremières, CRT)
-        sp_kwargs:      arguments supplémentaires pour SpatialPooler
+        input_dim:        dimension sensorielle brute
+        n_sdr:            dimension du SDR (SDRSpace.n)
+        w:                parcimonie du SDR (SDRSpace.w)
+        n_minicolumns:    nombre de minicolonnes (SpatialPooler.n_columns)
+        k_active:         colonnes actives dans SpatialPooler (I2.1)
+        n_grid_modules:   nombre de modules de grid cells (GridCellNetwork)
+        grid_periods:     périodes λ_k (copremières, CRT)
+        shared_sdr_space: SDRSpace partagé (None = créer un SDRSpace propre)
+        sp_kwargs:        arguments supplémentaires pour SpatialPooler
     """
 
     def __init__(
@@ -65,6 +72,7 @@ class SingleColumn(nn.Module):
         grid_periods: Optional[List[int]] = None,
         pe_lr: float = 0.001,
         pe_lr_pred: float = 0.01,
+        shared_sdr_space=None,
         sp_kwargs: Optional[dict] = None,
     ) -> None:
         super().__init__()
@@ -76,8 +84,11 @@ class SingleColumn(nn.Module):
 
         sp_kwargs = sp_kwargs or {}
 
-        # Module 1 : encodeur sensoriel
-        self.sdr_space = SDRSpace(input_dim=input_dim, n=n_sdr, w=w)
+        # Module 1 : encodeur sensoriel (partagé si fourni, sinon propre)
+        if shared_sdr_space is not None:
+            self.sdr_space = shared_sdr_space
+        else:
+            self.sdr_space = SDRSpace(input_dim=input_dim, n=n_sdr, w=w)
 
         # Module 2 : sélecteur homeöstatique
         self.spatial_pooler = SpatialPooler(
@@ -276,7 +287,14 @@ class CorticalColumn(nn.Module):
         self.enable_vote = enable_vote
         self.alpha_divergence = alpha_divergence
 
-        # K colonnes INDÉPENDANTES — pas de weight sharing (I6.1)
+        # Encodeur sensoriel partagé entre toutes les colonnes (L4 / SDRSpace).
+        # I6.1 est respecté : l'invariant concerne les permanences SP (L2/3),
+        # pas la projection sensorielle thalamique (L4).
+        # Sans partage : chaque colonne encode s_t dans un espace orthogonal
+        # → overlap inter-colonnes structurellement ~0 → consensus vide.
+        self.shared_sdr_space = SDRSpace(input_dim=input_dim, n=n_sdr, w=w)
+
+        # K colonnes INDÉPENDANTES (permanences SP, L6b, GridCell) — I6.1
         self.columns = nn.ModuleList([
             SingleColumn(
                 input_dim=input_dim,
@@ -288,6 +306,7 @@ class CorticalColumn(nn.Module):
                 grid_periods=grid_periods,
                 pe_lr=pe_lr,
                 pe_lr_pred=pe_lr_pred,
+                shared_sdr_space=self.shared_sdr_space,
                 sp_kwargs=sp_kwargs,
             )
             for _ in range(n_columns)
