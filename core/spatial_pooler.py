@@ -8,13 +8,16 @@ Invariants :
     I2.3 : Convergence vers {0,1} (Thm 2.2)
 
 Annealing (§7.2) :
-    γ(t) schedule linéaire par morceaux :
-        - Newborn stage : t < m   → γ = 1.0
-        - Décroissance  : t < m+τ → γ = 1 - (t-m)/τ
-        - Mature        : t ≥ m+τ → γ = 0.0
+    γ(t) schedule linéaire par morceaux avec plancher :
+        - Newborn stage : t < m         → γ = 1.0
+        - Décroissance  : m ≤ t < m+τ   → γ = gamma_floor + (1 - gamma_floor) · (1 - (t-m)/τ)
+        - Mature        : t ≥ m+τ        → γ = gamma_floor  (jamais en dessous)
     Effets :
         - Boost    : b_i*(t) = 1 + γ(t)·(b_i − 1)
-        - Dépression : δ⁻(t) = δ⁻·γ(t)
+        - Dépression : δ⁻(t) = δ_floor + (δ⁻ − δ_floor)·γ(t)
+    Pourquoi un plancher γ=0.2 :
+        Thousand Brains — l'apprentissage hebbien reste actif en continu.
+        Sans plancher, γ→0 gèle p̄ et empêche la correction de dérive.
 
 GPU :
     Toutes les opérations critiques (forward_batch, hebbian_update_batch)
@@ -48,17 +51,21 @@ class SpatialPooler(nn.Module):
         n_columns:      nombre de colonnes minicolumnes (neurones L2/3)
         k:              nombre exact de colonnes actives par pas (I2.1)
         delta_plus:          incrément hebbien (potentiation)
-        delta_minus:         décrément hebbien (dépression, annealed) — valeur max à γ=1
-        delta_minus_floor:   plancher de dépression à γ=0 (≥ 0, défaut 0.001).
-                             Empêche la dérive de p̄ vers 1 quand γ→0.
+        delta_minus:         décrément hebbien à γ=1. Ratio δ⁺/δ⁻ ≈ 21 pour
+                             équilibre avec potential_pct=0.5, s=0.0195.
+        delta_minus_floor:   plancher de dépression à γ=gamma_floor.
                              δ⁻(t) = δ_floor + (δ⁻ − δ_floor)·γ(t)
-        connected_perm: seuil de connexion synaptique (typiquement 0.5)
+        gamma_floor:         plancher du schedule γ — γ ne descend jamais
+                             en dessous (défaut 0.2, plasticité résiduelle).
+        connected_perm:      seuil de connexion synaptique (défaut 0.20)
         potential_pct:  fraction des inputs dans le potential pool de chaque
                         colonne (0.75 par défaut). Résout le déséquilibre
                         δ+/δ− : sans pool, 98% des bits reçoivent δ− et les
                         permanences s'effondrent.
-        newborn_steps:  durée du newborn stage m (annealing)
-        tau_decay:      durée de la décroissance γ
+        newborn_steps:  durée du newborn stage m (annealing, en steps)
+        tau_decay:      durée de la décroissance γ (en steps).
+                        Pour couvrir N epochs : tau = N_steps_total - newborn_steps.
+                        Ex : 3 epochs × 2000 img × 5 vues → tau = 30000 - 1000 = 29000.
         sigma:          largeur du voisinage homeöstatique (grille 4×4 → 0.8)
         beta:           force du boost homeöstatique
     """
@@ -68,11 +75,12 @@ class SpatialPooler(nn.Module):
         n_inputs: int,
         n_columns: int,
         k: int = 40,
-        delta_plus: float = 0.05,
-        delta_minus: float = 0.005,
-        delta_minus_floor: float = 0.001,
-        connected_perm: float = 0.5,
-        potential_pct: float = 0.75,
+        delta_plus: float = 0.015,
+        delta_minus: float = 0.000134,
+        delta_minus_floor: float = 0.0000268,
+        gamma_floor: float = 0.2,
+        connected_perm: float = 0.20,
+        potential_pct: float = 0.5,
         newborn_steps: int = 1000,
         tau_decay: int = 5000,
         sigma: float = 0.8,
@@ -86,6 +94,7 @@ class SpatialPooler(nn.Module):
         self.delta_plus = delta_plus
         self.delta_minus = delta_minus
         self.delta_minus_floor = delta_minus_floor
+        self.gamma_floor = gamma_floor
         self.connected_perm = connected_perm
         self.potential_pct = potential_pct
         self.newborn_steps = newborn_steps
@@ -111,10 +120,13 @@ class SpatialPooler(nn.Module):
         # p_ij ∈ [0,1], shape (n_columns, n_inputs)
         # Uniforme(0.3, 0.7) — jamais torch.randn (I2.2)
         # Les permanences hors potential pool restent à 0 (non utilisées).
+        # Uniforme(0.20, 0.24) — légèrement sous connected_perm=0.20 + marge.
+        # Démarre en zone sub-threshold pour que la potentiation hebbienne
+        # décide quelles synapses franchissent le seuil (convergence propre).
         permanences = torch.zeros(n_columns, n_inputs)
         permanences[potential_mask] = torch.empty(
             potential_mask.sum().item()
-        ).uniform_(0.3, 0.7)
+        ).uniform_(0.20, 0.24)
         self.register_buffer("permanences", permanences)
 
         # ── Vérification de l'équilibre δ+/δ− ────────────────────────────
@@ -166,17 +178,30 @@ class SpatialPooler(nn.Module):
 
     @torch.no_grad()
     def _gamma_tensor(self) -> torch.Tensor:
-        """Version tensorielle de gamma pour les chemins GPU chauds."""
+        """
+        Schedule γ(t) linéaire par morceaux avec plancher gamma_floor.
+
+        - t < m         : γ = 1.0
+        - m ≤ t < m+τ   : γ = gamma_floor + (1 - gamma_floor) · (1 - (t-m)/τ)
+        - t ≥ m+τ        : γ = gamma_floor  (plasticité résiduelle permanente)
+
+        Jamais en dessous de gamma_floor (défaut 0.2).
+        """
         t = self.t_step.to(dtype=torch.float32)
         m = t.new_tensor(float(self.newborn_steps))
         tau = t.new_tensor(float(self.tau_decay))
         tau_safe = torch.clamp(tau, min=1.0)
+        floor = t.new_tensor(float(self.gamma_floor))
 
-        gamma_decay = torch.clamp(1.0 - (t - m) / tau_safe, min=0.0, max=1.0)
+        # Fraction de décroissance dans [0, 1]
+        frac = torch.clamp((t - m) / tau_safe, min=0.0, max=1.0)
+        # γ décroît de 1.0 vers gamma_floor
+        gamma_decay = floor + (1.0 - floor) * (1.0 - frac)
+
         return torch.where(
             t < m,
             t.new_tensor(1.0),
-            torch.where(t < (m + tau), gamma_decay, t.new_tensor(0.0)),
+            gamma_decay,
         )
 
     @torch.no_grad()
@@ -348,7 +373,7 @@ class SpatialPooler(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"n_inputs={self.n_inputs}, n_columns={self.n_columns}, k={self.k}, "
-            f"potential_pct={self.potential_pct}, "
+            f"potential_pct={self.potential_pct}, connected_perm={self.connected_perm}, "
             f"δ⁺={self.delta_plus}, δ⁻={self.delta_minus}, δ⁻_floor={self.delta_minus_floor}, "
-            f"m={self.newborn_steps}, τ={self.tau_decay}"
+            f"γ_floor={self.gamma_floor}, m={self.newborn_steps}, τ={self.tau_decay}"
         )

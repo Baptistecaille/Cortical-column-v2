@@ -83,6 +83,7 @@ def generate_episode(
     max_rotation: float = 15.0,
     velocity_scale: float = 10.0,
     return_to_origin: bool = True,
+    velocity_noise_px: float = 0.0,
 ) -> Episode:
     """
     Génère une séquence de vues d'une image avec trajectoire spatiale.
@@ -91,13 +92,26 @@ def generate_episode(
     appliquent des translations et rotations aléatoires. Si return_to_origin=True,
     la dernière vue revient à (0,0) pour déclencher l'anchor().
 
+    Le paramètre velocity_noise_px ajoute un bruit gaussien N(0, σ) sur chaque
+    composante de vitesse (en pixels avant normalisation), ce qui garantit
+    ∑v_t ≠ 0 même avec return_to_origin=True. Sans bruit, la somme des vitesses
+    est exactement 0 → grid_err = 0.0° garanti mathématiquement, ce qui rend
+    la métrique d'intégration de chemin inutile comme thermomètre.
+
+    Valeurs recommandées :
+        velocity_noise_px=0.0  → comportement original (grid_err ≡ 0.0°)
+        velocity_noise_px=0.3  → erreur typique 3-8°, bon thermomètre
+        velocity_noise_px=1.0  → erreur ~15-25°, test de robustesse
+
     Args:
-        image:            tenseur (1, 28, 28) de l'image originale
-        n_views:          nombre total de vues (incluant la vue de retour)
-        max_translation:  translation maximale en pixels
-        max_rotation:     rotation maximale en degrés
-        velocity_scale:   facteur de normalisation des vitesses
-        return_to_origin: si True, la dernière vue revient à l'origine
+        image:             tenseur (1, 28, 28) de l'image originale
+        n_views:           nombre total de vues (incluant la vue de retour)
+        max_translation:   translation maximale en pixels
+        max_rotation:      rotation maximale en degrés
+        velocity_scale:    facteur de normalisation des vitesses
+        return_to_origin:  si True, la dernière vue revient à l'origine
+        velocity_noise_px: écart-type du bruit additif sur les vitesses (pixels).
+                           Appliqué après normalisation : noise = N(0,σ)/velocity_scale.
 
     Returns:
         Episode avec views (N, 784), velocities (N, 2), positions (N, 2)
@@ -146,9 +160,19 @@ def generate_episode(
         velocities.append(vel_return)
         positions.append(torch.zeros(2))
 
+    # ── Bruit additif sur les vitesses ───────────────────────────────────────
+    # Appliqué après construction pour ne pas perturber les transformations
+    # affines (les vues visuelles restent correctes, seul le signal proprioceptif
+    # est bruité). Casse la garantie ∑v_t = 0, donne une erreur de chemin
+    # non-triviale que l'anchor() doit corriger.
+    vel_stack = torch.stack(velocities, dim=0)   # (N, 2)
+    if velocity_noise_px > 0.0:
+        noise = torch.randn_like(vel_stack) * (velocity_noise_px / velocity_scale)
+        vel_stack = vel_stack + noise
+
     return Episode(
-        views=torch.stack(views, dim=0),           # (N, 784)
-        velocities=torch.stack(velocities, dim=0), # (N, 2)
+        views=torch.stack(views, dim=0),   # (N, 784)
+        velocities=vel_stack,              # (N, 2)
         positions=torch.stack(positions, dim=0),   # (N, 2)
         label=-1,
     )
@@ -185,6 +209,7 @@ def train_multiview(
     max_translation: float = 4.0,
     max_rotation: float = 15.0,
     anchor_confidence: float = 0.8,
+    velocity_noise_px: float = 0.3,
     log_every: int = 200,
 ) -> dict:
     """
@@ -205,6 +230,9 @@ def train_multiview(
         max_translation:    amplitude des translations (pixels)
         max_rotation:       amplitude des rotations (degrés)
         anchor_confidence:  confiance de l'ancrage (0=aucune, 1=totale)
+        velocity_noise_px:  bruit additif sur les vitesses (pixels, σ).
+                            0.0 → grid_err ≡ 0° (retour exact).
+                            0.3 → erreur typique 3-8°, thermomètre actif.
         log_every:          fréquence de log (en images)
 
     Returns:
@@ -237,6 +265,7 @@ def train_multiview(
                 max_translation=max_translation,
                 max_rotation=max_rotation,
                 return_to_origin=True,
+                velocity_noise_px=velocity_noise_px,
             )
             views = episode.views.to(device)
             velocities = episode.velocities.to(device)
@@ -332,6 +361,7 @@ def evaluate_multiview(
     device: torch.device,
     n_eval: int = 500,
     n_views: int = 5,
+    velocity_noise_px: float = 0.3,
 ) -> dict:
     """
     Évalue la qualité des représentations multi-vues.
@@ -364,7 +394,8 @@ def evaluate_multiview(
 
     for i in range(n_eval):
         img = images[i]
-        ep = generate_episode(img, n_views=n_views, return_to_origin=True)
+        ep = generate_episode(img, n_views=n_views, return_to_origin=True,
+                              velocity_noise_px=velocity_noise_px)
         views = ep.views.to(device)
         velocities = ep.velocities.to(device)
 
@@ -537,6 +568,9 @@ def main() -> None:
     parser.add_argument("--max_rotation",  type=float, default=15.0)
     parser.add_argument("--anchor_conf",   type=float, default=0.8,
                         help="Confiance de l'anchor (0=désactivé, 1=correction totale)")
+    parser.add_argument("--velocity_noise_px", type=float, default=0.3,
+                        help="Bruit additif sur les vitesses en pixels (0=désactivé). "
+                             "0.3 donne grid_err ~3-8° — thermomètre d'intégration actif.")
     parser.add_argument("--device",        type=str,   default="auto")
     parser.add_argument("--data_dir",      type=str,   default="./data")
     parser.add_argument("--verbose", "-v", action="store_true")
@@ -554,6 +588,12 @@ def main() -> None:
     logger.info(f"  {images.shape}  labels={labels.unique().tolist()}")
 
     # ── Modèle ───────────────────────────────────────────────────────────
+    # tau_decay calibré pour couvrir exactement n_epochs :
+    # γ descend de 1.0 à gamma_floor=0.2 sur la totalité des steps.
+    newborn_steps = 1000
+    total_steps = args.n_epochs * args.n_images * args.n_views
+    tau_decay = max(1, total_steps - newborn_steps)
+
     grid_periods = [3, 5, 7, 11, 13, 17][:args.n_grid_modules]
     model = CorticalColumn(
         n_columns=args.n_columns,
@@ -564,6 +604,10 @@ def main() -> None:
         k_active=args.k_active,
         n_grid_modules=args.n_grid_modules,
         grid_periods=grid_periods,
+        sp_kwargs={
+            "newborn_steps": newborn_steps,
+            "tau_decay":     tau_decay,
+        },
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -577,7 +621,12 @@ def main() -> None:
         f"Épisodes : {args.n_views} vues | "
         f"translation ±{args.max_translation}px | "
         f"rotation ±{args.max_rotation}° | "
-        f"anchor={args.anchor_conf}"
+        f"anchor={args.anchor_conf} | "
+        f"vel_noise={args.velocity_noise_px}px"
+    )
+    logger.info(
+        f"γ schedule : 1.0 → 0.2 sur {total_steps} steps "
+        f"(newborn={newborn_steps}, τ={tau_decay})"
     )
 
     # ── Évaluation AVANT entraînement ────────────────────────────────────
@@ -587,6 +636,7 @@ def main() -> None:
     metrics_before = evaluate_multiview(
         model, eval_imgs, eval_lbls, device,
         n_eval=args.n_eval, n_views=args.n_views,
+        velocity_noise_px=args.velocity_noise_px,
     )
     logger.info(
         f"  view_overlap={metrics_before['cross_view_overlap']:.3f} | "
@@ -607,6 +657,7 @@ def main() -> None:
         max_translation=args.max_translation,
         max_rotation=args.max_rotation,
         anchor_confidence=args.anchor_conf,
+        velocity_noise_px=args.velocity_noise_px,
         log_every=200 if args.verbose else 500,
     )
     elapsed = time.perf_counter() - t0
@@ -622,6 +673,7 @@ def main() -> None:
     metrics_after = evaluate_multiview(
         model, eval_imgs, eval_lbls, device,
         n_eval=args.n_eval, n_views=args.n_views,
+        velocity_noise_px=args.velocity_noise_px,
     )
     logger.info(
         f"  view_overlap={metrics_after['cross_view_overlap']:.3f} | "
