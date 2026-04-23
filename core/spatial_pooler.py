@@ -47,8 +47,11 @@ class SpatialPooler(nn.Module):
         n_inputs:       dimension du SDR d'entrée (= SDRSpace.n)
         n_columns:      nombre de colonnes minicolumnes (neurones L2/3)
         k:              nombre exact de colonnes actives par pas (I2.1)
-        delta_plus:     incrément hebbien (potentiation)
-        delta_minus:    décrément hebbien (dépression, annealed)
+        delta_plus:          incrément hebbien (potentiation)
+        delta_minus:         décrément hebbien (dépression, annealed) — valeur max à γ=1
+        delta_minus_floor:   plancher de dépression à γ=0 (≥ 0, défaut 0.001).
+                             Empêche la dérive de p̄ vers 1 quand γ→0.
+                             δ⁻(t) = δ_floor + (δ⁻ − δ_floor)·γ(t)
         connected_perm: seuil de connexion synaptique (typiquement 0.5)
         potential_pct:  fraction des inputs dans le potential pool de chaque
                         colonne (0.75 par défaut). Résout le déséquilibre
@@ -67,6 +70,7 @@ class SpatialPooler(nn.Module):
         k: int = 40,
         delta_plus: float = 0.05,
         delta_minus: float = 0.005,
+        delta_minus_floor: float = 0.001,
         connected_perm: float = 0.5,
         potential_pct: float = 0.75,
         newborn_steps: int = 1000,
@@ -81,6 +85,7 @@ class SpatialPooler(nn.Module):
         self.k = k
         self.delta_plus = delta_plus
         self.delta_minus = delta_minus
+        self.delta_minus_floor = delta_minus_floor
         self.connected_perm = connected_perm
         self.potential_pct = potential_pct
         self.newborn_steps = newborn_steps
@@ -286,7 +291,13 @@ class SpatialPooler(nn.Module):
         """
         B = x_batch.shape[0]
         g = self._gamma_tensor()
-        delta_minus_t = self.delta_minus * g
+        # δ⁻(t) = δ_floor + (δ⁻ − δ_floor) · γ(t)
+        # Plancher non nul pour éviter la dérive de p̄ quand γ→0 (§7.2).
+        # Sans ce plancher, la dépression s'annule et les permanences dérivent
+        # vers 1.0 car la potentiation continue sans contrepoids.
+        delta_minus_t = self.delta_minus_floor + (
+            self.delta_minus - self.delta_minus_floor
+        ) * g
 
         # One-hot des colonnes actives : (B, C)
         active_oh = torch.zeros(
@@ -338,6 +349,6 @@ class SpatialPooler(nn.Module):
         return (
             f"n_inputs={self.n_inputs}, n_columns={self.n_columns}, k={self.k}, "
             f"potential_pct={self.potential_pct}, "
-            f"δ⁺={self.delta_plus}, δ⁻={self.delta_minus}, "
+            f"δ⁺={self.delta_plus}, δ⁻={self.delta_minus}, δ⁻_floor={self.delta_minus_floor}, "
             f"m={self.newborn_steps}, τ={self.tau_decay}"
         )
