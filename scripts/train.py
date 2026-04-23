@@ -131,6 +131,7 @@ def train(
         "var_red": [],
         "sparsity_violation_rate": [],
         "gamma": [],
+        "pred_success_rate": [],
     }
 
     for t in range(n_steps):
@@ -159,12 +160,14 @@ def train(
             history["var_red"].append(metrics["var_red"])
             history["sparsity_violation_rate"].append(metrics["sparsity_violation_rate"])
             history["gamma"].append(gamma)
+            history["pred_success_rate"].append(metrics["pred_success_rate"])
 
             logger.info(
                 f"Pas {t+1:6d}/{n_steps} | "
                 f"ε={metrics['epsilon']:.4f} | "
                 f"var_red={metrics['var_red']:.4f} | "
                 f"γ={gamma:.4f} | "
+                f"pred={metrics['pred_success_rate']*100:.1f}% | "
                 f"sparsity_ok={metrics['sparsity_violation_rate'] < 0.05}"
             )
 
@@ -222,6 +225,7 @@ def main() -> None:
 
     logger.info(f"Métrique finale ε = {history['epsilon'][-1]:.4f}")
     logger.info(f"Variance reduction finale = {history['var_red'][-1]:.4f}")
+    logger.info(f"Taux de prédiction final = {history['pred_success_rate'][-1]*100:.1f}%")
 
 
 if __name__ == "__main__":

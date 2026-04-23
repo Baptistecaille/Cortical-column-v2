@@ -34,6 +34,15 @@ class SingleColumn(nn.Module):
     Chaque colonne possède ses propres permanences, grid cells et
     transformateur L6b — pas de partage de poids avec les autres colonnes.
 
+    Prédiction causal (predictive coding) :
+        À chaque pas t, AVANT d'encoder s_t, la colonne génère un SDR prédit
+        à partir du grid_code mémorisé au pas précédent :
+            sdr_predicted = binarize_topk(W_pred · grid_code_{t-1}, w)
+        Ce SDR est comparé au SDR observé sdr_t pour calculer le taux
+        de succès prédictif (métrique pred_success_rate).
+        Le prédicteur W_pred est le même que celui de pe_circuits (Lee 2025) —
+        pas de module supplémentaire.
+
     Args:
         input_dim:      dimension sensorielle brute
         n_sdr:          dimension du SDR (SDRSpace.n)
@@ -97,6 +106,38 @@ class SingleColumn(nn.Module):
             context_dim=4 * n_grid_modules,
         )
 
+        # Buffer mémorisant le grid_code du pas précédent.
+        # Utilisé pour générer la prédiction causale sdr_predicted au pas t
+        # AVANT de recevoir s_t (convention predictive coding Rao-Ballard 1999).
+        # Initialisé à zéro → prédiction nulle au premier pas (normal).
+        self.register_buffer(
+            "prev_grid_code",
+            torch.zeros(4 * n_grid_modules),
+        )
+
+    @torch.no_grad()
+    def _make_sdr_predicted(self) -> torch.Tensor:
+        """
+        Génère le SDR prédit pour le pas courant depuis le grid_code mémorisé.
+
+        Utilise le prédicteur top-down de PECircuits (W_pred déjà entraîné) :
+            logits      = W_pred · prev_grid_code + b_pred   (linéaire)
+            sdr_pred    = top-w strict(logits) → {0,1}^n_sdr (binarisation dure)
+
+        Convention causale : prev_grid_code est le grid_code du pas t-1,
+        mis à jour EN FIN de step(). La prédiction est donc disponible
+        AVANT de recevoir s_t, conformément au schéma Rao-Ballard (1999)
+        et à la projection L6b→L4 descendante.
+
+        Returns:
+            sdr_predicted: SDR prédit, shape (n_sdr,), binaire, ||·||₁ = w
+        """
+        logits = self.pe_circuits.predictor(self.prev_grid_code)  # (n_sdr,)
+        _, top_idx = torch.topk(logits, self.spatial_pooler.k, sorted=False)
+        sdr_predicted = torch.zeros(self.n_sdr, device=self.prev_grid_code.device)
+        sdr_predicted[top_idx] = 1.0
+        return sdr_predicted
+
     def step(
         self,
         s_t: torch.Tensor,
@@ -106,6 +147,15 @@ class SingleColumn(nn.Module):
         """
         Exécute un pas de traitement pour cette colonne.
 
+        Ordre causal (predictive coding) :
+            0. Prédiction top-down depuis grid_code_{t-1}  ← AVANT s_t
+            1. Encodage SDR de s_t
+            2. Sélection de colonnes (SpatialPooler)
+            3. Transformation ego→allo (L6b)
+            4. Intégration de chemin (GridCell) → grid_code_t
+            5. Apprentissage hebbien + PE circuits (train uniquement)
+            6. Mémorisation de grid_code_t → prev_grid_code  ← EN FIN
+
         Args:
             s_t:   stimulus sensoriel, shape (input_dim,)
             v_t:   vecteur de vitesse egocentrique, shape (2,)
@@ -113,12 +163,17 @@ class SingleColumn(nn.Module):
 
         Returns:
             dict avec :
-                sdr:        SDR binaire, shape (n_sdr,)
-                active:     indices actifs, shape (k_active,)
-                allo_phase: vecteur allocentrique L6b, shape (2·n_modules,)
-                phase:      phases grid cell, shape (n_modules, 2)
-                grid_code:  code de position, shape (4·n_modules,)
+                sdr:           SDR binaire observé,  shape (n_sdr,)
+                sdr_predicted: SDR prédit (top-down), shape (n_sdr,)
+                active:        indices actifs, shape (k_active,)
+                allo_phase:    vecteur allocentrique L6b, shape (2·n_modules,)
+                phase:         phases grid cell, shape (n_modules, 2)
+                grid_code:     code de position, shape (4·n_modules,)
         """
+        # ── Étape 0 — Prédiction causale (AVANT encodage de s_t) ─────────
+        # W_pred a été mis à jour au pas précédent → prédiction informée
+        sdr_predicted = self._make_sdr_predicted()          # {0,1}^n_sdr
+
         # Module 1 — Encodage SDR (I1.1, I1.2)
         sdr = self.sdr_space.encode(s_t)                    # {0,1}^n_sdr
 
@@ -154,12 +209,18 @@ class SingleColumn(nn.Module):
             )
             self.sdr_space.pe_update(delta_W)
 
+        # ── Étape 6 — Mémorisation du grid_code pour la prédiction au pas t+1
+        # Fait EN FIN de step(), après l'apprentissage PE, pour que W_pred
+        # soit à jour avant d'être utilisé par _make_sdr_predicted() au pas suivant.
+        self.prev_grid_code.data.copy_(grid_code.detach())
+
         return {
-            "sdr":        sdr,
-            "active":     active,
-            "allo_phase": allo_phase,
-            "phase":      phase,
-            "grid_code":  grid_code,
+            "sdr":           sdr,
+            "sdr_predicted": sdr_predicted,   # prédiction causale (t-1 → t)
+            "active":        active,
+            "allo_phase":    allo_phase,
+            "phase":         phase,
+            "grid_code":     grid_code,
         }
 
 
@@ -330,11 +391,13 @@ class CorticalColumn(nn.Module):
         all_grid_codes = []
         all_allo_phases = []
         all_actives = []
+        all_sdrs_predicted = []   # prédictions causales (une par colonne)
 
-        # ── Étapes 1–4 pour chaque colonne ───────────────────────────────
+        # ── Étapes 0–4 pour chaque colonne ───────────────────────────────
         for col in self.columns:
             result = col.step(s_t, v_t, train=train)
             all_sdrs.append(result["sdr"])
+            all_sdrs_predicted.append(result["sdr_predicted"])
             all_phases.append(result["phase"])
             all_grid_codes.append(result["grid_code"])
             all_allo_phases.append(result["allo_phase"])
@@ -372,16 +435,26 @@ class CorticalColumn(nn.Module):
         vote_stats = self.consensus.vote_with_stats(all_sdrs)
         consensus_sdr = vote_stats["consensus"]
 
+        # Prédiction de consensus : AND strict des SDRs prédits par chaque colonne.
+        # Interprétation : seuls les bits sur lesquels TOUTES les colonnes
+        # s'accordent sont considérés comme prédits avec confiance.
+        predicted_consensus = self.consensus.vote_with_stats(
+            all_sdrs_predicted
+        )["consensus"]
+
         return {
-            "sdr": all_sdrs[0],
-            "phase": all_phases[0],
-            "consensus": consensus_sdr,
-            "triplet": triplet,
-            "all_sdrs": all_sdrs,
-            "all_phases": all_phases,
-            "all_grid_codes": all_grid_codes,
-            "vote_stats": vote_stats,
-            "vote_sdr": vote_sdr,   # None si enable_vote=False
+            "sdr":              all_sdrs[0],
+            "sdr_predicted":    all_sdrs_predicted[0],          # col. 0, prédiction causale
+            "predicted_consensus": predicted_consensus,          # AND sur K prédictions
+            "phase":            all_phases[0],
+            "consensus":        consensus_sdr,
+            "triplet":          triplet,
+            "all_sdrs":         all_sdrs,
+            "all_sdrs_predicted": all_sdrs_predicted,
+            "all_phases":       all_phases,
+            "all_grid_codes":   all_grid_codes,
+            "vote_stats":       vote_stats,
+            "vote_sdr":         vote_sdr,   # None si enable_vote=False
         }
 
     def step_batch(
@@ -439,11 +512,17 @@ class CorticalColumn(nn.Module):
         }
 
     def reset(self) -> None:
-        """Réinitialise l'état interne de toutes les colonnes (nouvel épisode)."""
+        """Réinitialise l'état interne de toutes les colonnes (nouvel épisode).
+
+        Inclut le buffer de prédiction prev_grid_code : après un reset,
+        la première prédiction est nulle (prior uniforme sur la position) —
+        comportement correct car le modèle ne sait pas encore où il se trouve.
+        """
         for col in self.columns:
             col.grid_cell.reset()
             col.layer6b.reset_thalamic_state()
             col.pe_circuits.reset()
+            col.prev_grid_code.data.zero_()   # prédiction nulle au démarrage
 
     def extra_repr(self) -> str:
         return (
