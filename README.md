@@ -126,6 +126,8 @@ pip install torch torchvision scikit-learn numpy
 ```
 
 > Le dépôt ne fournit pas actuellement de `requirements.txt` / `pyproject.toml`.
+> Cette absence n’est pas bloquante pour les scripts fournis, mais l’ajout d’un fichier
+> de dépendances versionné reste une amélioration recommandée pour la reproductibilité.
 
 ---
 
@@ -237,7 +239,10 @@ Les dataloaders spécifiques restent à brancher selon les données disponibles 
 
 Voir `docs/roadmap-implementation-v3.md` :
 - Phase 1 core : implémentée et testable,
-- Phase 2 PE circuits : intégration dans `CorticalColumn` à finaliser selon la lacune 1 (connexion explicite PE+/PE− au `step()` principal) de `docs/roadmap-implementation-v3.md`,
+- Phase 2 PE circuits :
+  - intégration dans `CorticalColumn` à finaliser selon la lacune 1 de
+    `docs/roadmap-implementation-v3.md`,
+  - lacune 1 : connexion explicite des circuits PE+/PE− au `step()` principal.
 - Phase 3 extensions biologiques : implémentées,
 - Phase 4 benchmark JEPA : squelette prêt, intégrations datasets à finaliser.
 
