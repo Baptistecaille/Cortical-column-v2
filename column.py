@@ -24,6 +24,7 @@ from core.layer6b import Layer6bTransformer
 from core.grid_cell import GridCellNetwork
 from core.displacement import DisplacementAlgebra, DisplacementTriplet
 from core.consensus import MultiColumnConsensus
+from extensions.pe_circuits import PECircuits
 
 
 class SingleColumn(nn.Module):
@@ -53,12 +54,16 @@ class SingleColumn(nn.Module):
         k_active: int = 40,
         n_grid_modules: int = 6,
         grid_periods: Optional[List[int]] = None,
+        pe_lr: float = 0.001,
+        pe_lr_pred: float = 0.01,
         sp_kwargs: Optional[dict] = None,
     ) -> None:
         super().__init__()
 
         self.n_sdr = n_sdr
         self.n_grid_modules = n_grid_modules
+        self.pe_lr = pe_lr
+        self.pe_lr_pred = pe_lr_pred
 
         sp_kwargs = sp_kwargs or {}
 
@@ -83,6 +88,13 @@ class SingleColumn(nn.Module):
         self.grid_cell = GridCellNetwork(
             n_modules=n_grid_modules,
             periods=grid_periods,
+        )
+
+        # Module PE : erreur de prédiction signée (Lee 2025 — PRIORITÉ 1)
+        # Prédicteur top-down : grid_code (4·n_modules) → SDR attendu (n_sdr)
+        self.pe_circuits = PECircuits(
+            dim=n_sdr,
+            context_dim=4 * n_grid_modules,
         )
 
     def step(
@@ -124,9 +136,23 @@ class SingleColumn(nn.Module):
         phase = self.grid_cell.integrate(v_t)               # (n_modules, 2)
         grid_code = self.grid_cell.get_code()               # (4·n_modules,)
 
-        # Apprentissage hebbien (I2.3) — @no_grad interne
         if train:
+            # Apprentissage hebbien SP (I2.3) — @no_grad interne
             self.spatial_pooler.hebbian_update(sdr, active)
+
+            # PE circuits (Lee 2025 — PRIORITÉ 1)
+            # 1. Mise à jour du prédicteur top-down + états PE+/PE−
+            self.pe_circuits.step_with_update(
+                sdr.float(),
+                grid_code,
+                lr_pred=self.pe_lr_pred,
+            )
+            # 2. Mise à jour de W_enc via l'erreur PE signée
+            delta_W = self.pe_circuits.modulated_update(
+                s_t.float(),
+                learning_rate=self.pe_lr,
+            )
+            self.sdr_space.pe_update(delta_W)
 
         return {
             "sdr": sdr,
@@ -170,6 +196,8 @@ class CorticalColumn(nn.Module):
         n_grid_modules: int = 6,
         grid_periods: Optional[List[int]] = None,
         consensus_threshold: float = 1.0,
+        pe_lr: float = 0.001,
+        pe_lr_pred: float = 0.01,
         sp_kwargs: Optional[dict] = None,
     ) -> None:
         super().__init__()
@@ -188,6 +216,8 @@ class CorticalColumn(nn.Module):
                 k_active=k_active,
                 n_grid_modules=n_grid_modules,
                 grid_periods=grid_periods,
+                pe_lr=pe_lr,
+                pe_lr_pred=pe_lr_pred,
                 sp_kwargs=sp_kwargs,
             )
             for _ in range(n_columns)
@@ -327,6 +357,7 @@ class CorticalColumn(nn.Module):
         for col in self.columns:
             col.grid_cell.reset()
             col.layer6b.reset_thalamic_state()
+            col.pe_circuits.reset()
 
     def extra_repr(self) -> str:
         return (

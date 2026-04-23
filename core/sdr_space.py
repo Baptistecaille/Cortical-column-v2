@@ -88,6 +88,21 @@ class SDRSpace(nn.Module):
         """Alias de encode() pour compatibilité nn.Module."""
         return self.encode(s)
 
+    @torch.no_grad()
+    def pe_update(self, delta_W: torch.Tensor) -> None:
+        """
+        Applique une mise à jour PE-modulée à W_enc.
+
+        Clamp ≥ 0 pour respecter la contrainte glutamatergique (§5, Bug B1) :
+        les poids excitateurs ne peuvent pas devenir inhibiteurs.
+
+        Réf. : Lee 2025, Éq. 6 ; §5 — Initialisation des poids.
+
+        Args:
+            delta_W: incrément de poids, shape (n, input_dim) = W_enc.weight.shape
+        """
+        self.W_enc.weight.data.add_(delta_W).clamp_(min=0.0)
+
     def sparsity(self) -> float:
         """Retourne le ratio de parcimonie w/n."""
         return self.w / self.n

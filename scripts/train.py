@@ -59,6 +59,7 @@ def generate_synthetic_sequence(
     """
     inputs = []
     velocities = []
+    phase = torch.linspace(0, 2 * math.pi, input_dim)
 
     # Position initiale
     pos = torch.zeros(2)
@@ -70,10 +71,10 @@ def generate_synthetic_sequence(
         pos = pos + vel
 
         # Stimulus : projection sinusoïdale de la position (grille spatiale)
-        phase = torch.linspace(0, 2 * math.pi, input_dim)
+        step_term = t * 0.01
         stimulus = (
-            0.5 * torch.sin(phase * pos[0].item() + t * 0.01)
-            + 0.5 * torch.cos(phase * pos[1].item() + t * 0.01)
+            0.5 * torch.sin(phase * pos[0] + step_term)
+            + 0.5 * torch.cos(phase * pos[1] + step_term)
         )
         # Bruit sensoriel
         stimulus = stimulus + 0.1 * torch.randn(input_dim)
@@ -116,6 +117,7 @@ def train(
     logger.setLevel(getattr(logging, log_level))
     model = model.to(device)
     model.reset()
+    evaluator = UnsupervisedEvaluator(model, expected_w=model.columns[0].sdr_space.w)
 
     logger.info(f"Démarrage de l'entraînement : {n_steps} pas, {model.n_columns} colonnes")
 
@@ -140,7 +142,6 @@ def train(
 
         # Évaluation périodique
         if (t + 1) % eval_every == 0 or t == 0:
-            evaluator = UnsupervisedEvaluator(model, expected_w=model.columns[0].sdr_space.w)
             t_eval_start = max(0, t - 200)
             t_eval_end = min(n_steps, t + 1)
 

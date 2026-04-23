@@ -228,6 +228,7 @@ def train_multiview(
 
         for idx_in_epoch, img_idx in enumerate(perm):
             img = images[img_idx]   # (1, 28, 28)
+            should_log = (idx_in_epoch + 1) % log_every == 0
 
             # Génération de l'épisode
             episode = generate_episode(
@@ -237,6 +238,8 @@ def train_multiview(
                 max_rotation=max_rotation,
                 return_to_origin=True,
             )
+            views = episode.views.to(device)
+            velocities = episode.velocities.to(device)
 
             # Réinitialisation de l'état temporel pour chaque épisode
             model.reset()
@@ -247,36 +250,35 @@ def train_multiview(
                 for col in model.columns
             ]
 
-            sdrs_in_episode = []
-            phases_at_origin = []   # phases quand position ≈ (0,0)
+            sdrs_in_episode = [] if should_log else None
+            phases_at_origin = [] if should_log else None   # phases quand position ≈ (0,0)
 
             # ── Présentation séquentielle des vues ───────────────────────
-            for view_i in range(episode.views.shape[0]):
-                s_t = episode.views[view_i].to(device)
-                v_t = episode.velocities[view_i].to(device)
+            for view_i in range(views.shape[0]):
+                s_t = views[view_i]
+                v_t = velocities[view_i]
 
                 result = model.step(s_t, v_t, train=True)
-                sdrs_in_episode.append(result["sdr"].cpu())
+                if should_log:
+                    sdrs_in_episode.append(result["sdr"].cpu())
 
                 # Enregistrer les phases à la vue de retour (position ≈ 0)
                 is_return = (view_i == episode.views.shape[0] - 1)
-                if is_return or view_i == 0:
-                    phases_at_origin.append(
-                        model.columns[0].grid_cell.phases.clone().cpu()
-                    )
+                if should_log and (is_return or view_i == 0):
+                    phases_at_origin.append(model.columns[0].grid_cell.phases.clone().cpu())
 
                 # ── Anchor au retour à l'origine ─────────────────────────
                 if is_return and anchor_confidence > 0:
                     for c, col in enumerate(model.columns):
                         col.grid_cell.anchor(
-                            initial_phases[c].to(device),
+                            initial_phases[c],
                             confidence=anchor_confidence,
                         )
 
             images_processed += 1
 
             # ── Métriques (calculées périodiquement) ─────────────────────
-            if (idx_in_epoch + 1) % log_every == 0:
+            if should_log:
                 # Overlap inter-vues (Jaccard entre vue 0 et vue 1)
                 if len(sdrs_in_episode) >= 2:
                     s0, s1 = sdrs_in_episode[0].float(), sdrs_in_episode[1].float()
@@ -363,6 +365,8 @@ def evaluate_multiview(
     for i in range(n_eval):
         img = images[i]
         ep = generate_episode(img, n_views=n_views, return_to_origin=True)
+        views = ep.views.to(device)
+        velocities = ep.velocities.to(device)
 
         model.reset()
         initial_phases = [col.grid_cell.phases.clone() for col in model.columns]
@@ -370,9 +374,9 @@ def evaluate_multiview(
         sdrs_at_views = []
 
         # Présentation séquentielle
-        for v in range(ep.views.shape[0]):
-            s_t = ep.views[v].to(device)
-            vel = ep.velocities[v].to(device)
+        for v in range(views.shape[0]):
+            s_t = views[v]
+            vel = velocities[v]
             result = model.step(s_t, vel, train=False)
             sdrs_at_views.append(result["all_sdrs"])   # list of K SDRs
 
@@ -402,7 +406,7 @@ def evaluate_multiview(
 
         # ── Anchor et erreur après ────────────────────────────────────────
         for c, col in enumerate(model.columns):
-            col.grid_cell.anchor(initial_phases[c].to(device), confidence=1.0)
+            col.grid_cell.anchor(initial_phases[c], confidence=1.0)
         phase_after = model.columns[0].grid_cell.phases.clone()
         err_after = (
             (phase_after - initial_phases[0].to(device) + math.pi)

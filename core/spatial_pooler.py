@@ -160,15 +160,24 @@ class SpatialPooler(nn.Module):
     # ── Annealing ────────────────────────────────────────────────────────
 
     @torch.no_grad()
+    def _gamma_tensor(self) -> torch.Tensor:
+        """Version tensorielle de gamma pour les chemins GPU chauds."""
+        t = self.t_step.to(dtype=torch.float32)
+        m = t.new_tensor(float(self.newborn_steps))
+        tau = t.new_tensor(float(self.tau_decay))
+        tau_safe = torch.clamp(tau, min=1.0)
+
+        gamma_decay = torch.clamp(1.0 - (t - m) / tau_safe, min=0.0, max=1.0)
+        return torch.where(
+            t < m,
+            t.new_tensor(1.0),
+            torch.where(t < (m + tau), gamma_decay, t.new_tensor(0.0)),
+        )
+
+    @torch.no_grad()
     def gamma(self) -> float:
         """γ(t) ∈ [0,1], schedule linéaire par morceaux. Réf. §7.2."""
-        t = self.t_step.item()
-        m, tau = self.newborn_steps, self.tau_decay
-        if t < m:
-            return 1.0
-        elif t < m + tau:
-            return 1.0 - (t - m) / tau
-        return 0.0
+        return float(self._gamma_tensor().item())
 
     # ── Boost homeöstatique ───────────────────────────────────────────────
 
@@ -184,7 +193,7 @@ class SpatialPooler(nn.Module):
         """
         mu = self.boost_weights @ self.duty_cycle          # (C,)
         b_base = torch.exp(self.beta * (mu - self.duty_cycle))
-        return 1.0 + self.gamma() * (b_base - 1.0)
+        return 1.0 + self._gamma_tensor() * (b_base - 1.0)
 
     # ── Forward — interface simple (1 sample) ────────────────────────────
 
@@ -276,7 +285,7 @@ class SpatialPooler(nn.Module):
             active_batch: indices actifs, shape (B, k)
         """
         B = x_batch.shape[0]
-        g = self.gamma()
+        g = self._gamma_tensor()
         delta_minus_t = self.delta_minus * g
 
         # One-hot des colonnes actives : (B, C)
