@@ -50,7 +50,7 @@ Références de conception et invariants : `CLAUDE.md`.
 ### Module 4 — `GridCellNetwork` (`core/grid_cell.py`)
 - Intégration de chemin sur tore 2D.
 - Phases bornées modulo `2π`.
-- `get_code()` retourne `4 × n_modules` composantes cos/sin.
+- `get_code()` retourne `4 · n_modules` composantes cos/sin.
 - `anchor()` corrige par pondération en `1/λ_k`.
 - Vérification des périodes copremières.
 
@@ -237,7 +237,7 @@ Les dataloaders spécifiques restent à brancher selon les données disponibles 
 
 Voir `docs/roadmap-implementation-v3.md` :
 - Phase 1 core : implémentée et testable,
-- Phase 2 PE circuits : implémentée mais intégration encore à consolider selon la roadmap,
+- Phase 2 PE circuits : intégration dans `CorticalColumn` à finaliser selon la lacune 1 de `docs/roadmap-implementation-v3.md`,
 - Phase 3 extensions biologiques : implémentées,
 - Phase 4 benchmark JEPA : squelette prêt, intégrations datasets à finaliser.
 
@@ -260,4 +260,3 @@ Voir `docs/roadmap-implementation-v3.md` :
 - Formalisation mathématique : `docs/Formalisation_Mille_Cerveaux.pdf`
 - Backlog invariants : `docs/criteres_evaluation_modules.md`
 - Script de vérification : `scripts/run_invariants.py`
-
