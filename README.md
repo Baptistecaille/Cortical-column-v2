@@ -213,6 +213,10 @@ Squelette de benchmark contre familles JEPA sur :
 - ImageNet-1K
 
 Les dataloaders spécifiques restent à brancher selon les données disponibles localement.
+Prochaines étapes recommandées :
+- implémenter les loaders CO3Dv2/CLEVR/SSv2/Ego4D/ImageNet dans `eval/benchmark.py`,
+- documenter les chemins de données et formats attendus,
+- lier ce travail à la lacune 2 de `docs/roadmap-implementation-v3.md`.
 
 ---
 
