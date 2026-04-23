@@ -239,10 +239,8 @@ Les dataloaders spécifiques restent à brancher selon les données disponibles 
 
 Voir `docs/roadmap-implementation-v3.md` :
 - Phase 1 core : implémentée et testable,
-- Phase 2 PE circuits :
-  - intégration dans `CorticalColumn` à finaliser selon la lacune 1 de
-    `docs/roadmap-implementation-v3.md`,
-  - lacune 1 : connexion explicite des circuits PE+/PE− au `step()` principal.
+- Phase 2 PE circuits : intégration dans `CorticalColumn` à finaliser
+  (lacune 1 : connexion explicite PE+/PE− au `step()` principal),
 - Phase 3 extensions biologiques : implémentées,
 - Phase 4 benchmark JEPA : squelette prêt, intégrations datasets à finaliser.
 
