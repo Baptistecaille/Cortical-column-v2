@@ -155,6 +155,32 @@ def train(
 
             gamma = model.columns[0].spatial_pooler.gamma()
 
+            # ── Diagnostic interne (dernier pas) ─────────────────────────
+            # Complète les métriques agrégées avec des stats instantanées
+            # pour comprendre ce qui se passe dans le modèle.
+            with torch.no_grad():
+                diag_result = model.step(inputs[t], velocities[t], train=False)
+
+                # Nombre de bits actifs dans le consensus
+                n_consensus = int(diag_result["consensus"].sum().item())
+
+                # Overlap moyen entre les SDRs des K colonnes
+                # (mesure la cohérence inter-colonnes, indépendante du AND)
+                all_s = diag_result["all_sdrs"]
+                K = len(all_s)
+                overlaps = []
+                for i in range(K):
+                    for j in range(i + 1, K):
+                        inter = (all_s[i] * all_s[j]).sum().item()
+                        overlaps.append(inter)
+                mean_overlap_cols = sum(overlaps) / len(overlaps) if overlaps else 0.0
+
+                # Fraction de permanences connectées (col. 0)
+                p_stats = model.columns[0].spatial_pooler.permanence_stats()
+
+                # Magnitude PE (col. 0)
+                pe_stats = model.columns[0].pe_circuits.pe_magnitude()
+
             history["step"].append(t + 1)
             history["epsilon"].append(metrics["epsilon"])
             history["var_red"].append(metrics["var_red"])
@@ -165,10 +191,12 @@ def train(
             logger.info(
                 f"Pas {t+1:6d}/{n_steps} | "
                 f"ε={metrics['epsilon']:.4f} | "
-                f"var_red={metrics['var_red']:.4f} | "
-                f"γ={gamma:.4f} | "
                 f"pred={metrics['pred_success_rate']*100:.1f}% | "
-                f"sparsity_ok={metrics['sparsity_violation_rate'] < 0.05}"
+                f"γ={gamma:.4f} | "
+                f"consensus_bits={n_consensus} | "
+                f"col_overlap={mean_overlap_cols:.1f} | "
+                f"p_conn={p_stats['frac_connected']:.2f} | "
+                f"PE+={pe_stats['pe_pos_mean']:.3f} PE-={pe_stats['pe_neg_mean']:.3f}"
             )
 
     logger.info("Entraînement terminé.")
