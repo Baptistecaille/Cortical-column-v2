@@ -106,15 +106,34 @@ def train(
     anchor_confidence: float = 0.8,
     eval_every: int = 500,
     device: str = "cpu",
+    lambda_mix: float = 0.5,
+    use_surprise_annealing: bool = True,
 ) -> dict:
     """
-    Boucle d'entraînement multi-vues sur MNIST, alignée sur test_multiview.py.
+    Boucle d'entraînement multi-vues sur MNIST avec annealing surprise-driven.
 
     Métriques loguées :
         cross_view_overlap : Jaccard SDR_vue0 / SDR_vue1 (même image)
         pred_success_rate  : % de prédictions correctes (W_pred)
         p_conn             : fraction de permanences connectées
-        gamma              : facteur d'annealing
+        gamma              : γ effectif (mélange schedule + surprise)
+        surprise           : ε_t moyen sur l'épisode courant
+
+    Nouveau paramètre — annealing surprise-driven (Rao & Ballard 1999) :
+        use_surprise_annealing : active la modulation de γ par la surprise
+        lambda_mix             : poids du schedule temporel vs surprise
+                                 λ=1.0 → schedule pur (comportement v1)
+                                 λ=0.0 → surprise pure
+                                 λ=0.5 → équilibre (défaut)
+
+    Pipeline par épisode :
+        1. Générer n_views vues de l'image
+        2. Pour chaque vue v :
+            a. model.step() avec gamma_override calculé depuis la surprise
+               du pas PRÉCÉDENT (convention causale : on ne connaît pas
+               encore la surprise courante au moment de l'update hebbien)
+            b. Récupérer result["surprise"] pour le pas suivant
+        3. Anchor grid cells au retour à l'origine
 
     Returns:
         history dict
@@ -127,13 +146,21 @@ def train(
         "cross_view_overlap": [],
         "pred_success_rate": [],
         "gamma": [],
+        "gamma_surprise_ema": [],
+        "surprise": [],
         "p_conn": [],
     }
 
     _overlap_window: List[float] = []
-    _pred_window: List[float] = []   # moyenne glissante pred sur 100 épisodes
+    _pred_window: List[float] = []
+    _surprise_window: List[float] = []
     images_processed = 0
     t0 = time.perf_counter()
+
+    # Surprise du pas précédent (initialisée à 1.0 = surprise maximale).
+    # Au démarrage, W_pred est non calibré → on suppose surprise totale.
+    # Sera écrasée dès le premier model.step().
+    prev_surprise: float = 1.0
 
     for epoch in range(n_epochs):
         perm = torch.randperm(N)
@@ -149,17 +176,40 @@ def train(
             views = views.to(device)
             velocities = velocities.to(device)
 
-            # Reset entre épisodes (comme test_multiview.py)
+            # Reset entre épisodes
             model.reset()
             initial_phases = [col.grid_cell.phases.clone() for col in model.columns]
 
             sdrs_episode = []
             sdrs_predicted_episode = []
+            surprises_episode = []
 
             for v in range(views.shape[0]):
-                result = model.step(views[v], velocities[v], train=True)
+                # ── Calcul du γ effectif depuis la surprise du pas PRÉCÉDENT ──
+                # Convention causale : on utilise ε_{t-1} pour modérer l'update
+                # hebbien au pas t, car ε_t n'est connu qu'après l'observation.
+                # Pendant le newborn stage, gamma_surprise() retourne 1.0
+                # inconditionnellement (W_pred non calibré).
+                if use_surprise_annealing:
+                    sp = model.columns[0].spatial_pooler
+                    gamma_eff = sp.gamma_surprise(
+                        surprise=prev_surprise,
+                        lambda_mix=lambda_mix,
+                    )
+                else:
+                    gamma_eff = None  # schedule temporel pur
+
+                result = model.step(
+                    views[v], velocities[v],
+                    train=True,
+                    gamma_override=gamma_eff,
+                )
                 sdrs_episode.append(result["sdr"].cpu())
                 sdrs_predicted_episode.append(result["sdr_predicted"].cpu())
+                surprises_episode.append(result["surprise"])
+
+                # Mémorisation de la surprise courante pour le pas suivant
+                prev_surprise = result["surprise"]
 
             # Anchor au retour à l'origine
             if anchor_confidence > 0:
@@ -185,8 +235,6 @@ def train(
                     _overlap_window.pop(0)
                 overlap_smooth = sum(_overlap_window) / len(_overlap_window)
 
-                # pred_success_rate — moyenne glissante sur 100 épisodes
-                # (un épisode = 5 pas → trop bruité sur 1 seul épisode)
                 pred_stats = batch_prediction_success_rate(
                     sdrs_predicted_episode, sdrs_episode
                 )
@@ -195,21 +243,35 @@ def train(
                     _pred_window.pop(0)
                 pred_smooth = sum(_pred_window) / len(_pred_window)
 
-                gamma = model.columns[0].spatial_pooler.gamma()
-                p_stats = model.columns[0].spatial_pooler.permanence_stats()
+                # Surprise moyenne sur l'épisode (fenêtre glissante 100 épisodes)
+                ep_surprise = sum(surprises_episode) / max(len(surprises_episode), 1)
+                _surprise_window.append(ep_surprise)
+                if len(_surprise_window) > 100:
+                    _surprise_window.pop(0)
+                surprise_smooth = sum(_surprise_window) / len(_surprise_window)
+
+                sp = model.columns[0].spatial_pooler
+                gamma_temporal = sp.gamma()
+                gamma_eff_log = sp.gamma_surprise(prev_surprise, lambda_mix) \
+                    if use_surprise_annealing else gamma_temporal
+                p_stats = sp.permanence_stats()
                 elapsed = time.perf_counter() - t0
                 ips = images_processed / elapsed
 
                 history["step"].append(images_processed)
                 history["cross_view_overlap"].append(overlap_smooth)
                 history["pred_success_rate"].append(pred_smooth)
-                history["gamma"].append(gamma)
+                history["gamma"].append(gamma_eff_log)
+                history["gamma_surprise_ema"].append(gamma_temporal)
+                history["surprise"].append(surprise_smooth)
                 history["p_conn"].append(p_stats["frac_connected"])
 
                 logger.info(
                     f"Epoch {epoch+1} | {idx_in_epoch+1:5d}/{N} | "
                     f"{ips:4.0f} img/s | "
-                    f"γ={gamma:.3f} | "
+                    f"γ_eff={gamma_eff_log:.3f} | "
+                    f"γ_sched={gamma_temporal:.3f} | "
+                    f"ε={surprise_smooth:.3f} | "
                     f"p_conn={p_stats['frac_connected']:.2f} | "
                     f"p̄={p_stats['mean']:.3f} | "
                     f"overlap={overlap_smooth:.3f} | "
@@ -240,6 +302,15 @@ def main() -> None:
     parser.add_argument("--device",         type=str,   default="cpu")
     parser.add_argument("--data_dir",       type=str,   default="./data")
     parser.add_argument("--verbose", "-v",  action="store_true")
+    parser.add_argument(
+        "--lambda_mix", type=float, default=0.5,
+        help="Poids du schedule temporel vs surprise dans γ_effectif. "
+             "0.0=surprise pure, 1.0=schedule pur, 0.5=équilibre (défaut)."
+    )
+    parser.add_argument(
+        "--no_surprise_annealing", action="store_true",
+        help="Désactive l'annealing surprise-driven — revient au schedule pur."
+    )
     args = parser.parse_args()
 
     # tau_decay calibré sur le total de steps (comme test_multiview.py)
@@ -288,6 +359,12 @@ def main() -> None:
     logger.info(f"Chargement MNIST ({args.n_images} images)...")
     images, labels = load_mnist(args.n_images, args.data_dir)
 
+    use_surprise = not args.no_surprise_annealing
+    logger.info(
+        f"Annealing surprise-driven : {'activé' if use_surprise else 'désactivé'} | "
+        f"λ_mix={args.lambda_mix:.2f}"
+    )
+
     # Entraînement
     history = train(
         model=model,
@@ -299,6 +376,8 @@ def main() -> None:
         anchor_confidence=args.anchor_conf,
         eval_every=args.eval_every,
         device=args.device,
+        lambda_mix=args.lambda_mix,
+        use_surprise_annealing=use_surprise,
     )
 
     if history["cross_view_overlap"]:

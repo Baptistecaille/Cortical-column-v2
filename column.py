@@ -151,6 +151,7 @@ class SingleColumn(nn.Module):
         s_t: torch.Tensor,
         v_t: torch.Tensor,
         train: bool = True,
+        gamma_override: float | None = None,
     ) -> dict:
         """
         Exécute un pas de traitement pour cette colonne.
@@ -165,9 +166,13 @@ class SingleColumn(nn.Module):
             6. Mémorisation de grid_code_t → prev_grid_code  ← EN FIN
 
         Args:
-            s_t:   stimulus sensoriel, shape (input_dim,)
-            v_t:   vecteur de vitesse egocentrique, shape (2,)
-            train: si True, effectue la mise à jour hebbienne
+            s_t:            stimulus sensoriel, shape (input_dim,)
+            v_t:            vecteur de vitesse egocentrique, shape (2,)
+            train:          si True, effectue la mise à jour hebbienne
+            gamma_override: γ effectif calculé depuis gamma_surprise() dans
+                            train.py. Si None → schedule temporel pur.
+                            Permet de moduler la plasticité par la surprise
+                            de prédiction (Rao & Ballard 1999).
 
         Returns:
             dict avec :
@@ -177,6 +182,7 @@ class SingleColumn(nn.Module):
                 allo_phase:    vecteur allocentrique L6b, shape (2·n_modules,)
                 phase:         phases grid cell, shape (n_modules, 2)
                 grid_code:     code de position, shape (4·n_modules,)
+                surprise:      erreur de prédiction Jaccard ∈ [0,1]
         """
         # ── Étape 0 — Prédiction causale (AVANT encodage de s_t) ─────────
         # W_pred a été mis à jour au pas précédent → prédiction informée
@@ -200,9 +206,21 @@ class SingleColumn(nn.Module):
         phase = self.grid_cell.integrate(v_t)               # (n_modules, 2)
         grid_code = self.grid_cell.get_code()               # (4·n_modules,)
 
+        # ── Calcul de la surprise (Jaccard complement SDR_pred vs SDR_obs) ─
+        # ε_t = 1 - |sdr_predicted ∩ sdr| / |sdr_predicted ∪ sdr|
+        # ε = 0 : prédiction parfaite → plasticité minimale (γ_floor)
+        # ε = 1 : prédiction nulle   → plasticité maximale (γ = 1.0)
+        # Calcul @no_grad, pas de coût autograd.
+        with torch.no_grad():
+            inter = (sdr_predicted * sdr).sum()
+            union = ((sdr_predicted + sdr) > 0).float().sum().clamp(min=1.0)
+            surprise = float(1.0 - inter / union)
+
         if train:
-            # Apprentissage hebbien SP (I2.3) — @no_grad interne
-            self.spatial_pooler.hebbian_update(sdr, active)
+            # Apprentissage hebbien SP (I2.3) — @no_grad interne.
+            # gamma_override injecté ici si fourni par CorticalColumn.step()
+            # (calculé depuis spatial_pooler.gamma_surprise(surprise) dans train.py).
+            self.spatial_pooler.hebbian_update(sdr, active, gamma_override=gamma_override)
 
             # PE circuits (Lee 2025 — PRIORITÉ 1)
             # 1. Mise à jour du prédicteur top-down + états PE+/PE−
@@ -231,6 +249,7 @@ class SingleColumn(nn.Module):
             "prev_phase":    prev_phase,
             "phase":         phase,
             "grid_code":     grid_code,
+            "surprise":      surprise,         # ε_t ∈ [0,1] — erreur Jaccard
         }
 
 
@@ -374,6 +393,7 @@ class CorticalColumn(nn.Module):
         s_t: torch.Tensor,
         v_t: torch.Tensor,
         train: bool = True,
+        gamma_override: float | None = None,
     ) -> dict:
         """
         Exécute un pas complet du pseudo-algorithme pour toutes les colonnes.
@@ -383,9 +403,13 @@ class CorticalColumn(nn.Module):
             → GridCellNetwork → DisplacementAlgebra → MultiColumnConsensus
 
         Args:
-            s_t:   stimulus sensoriel, shape (input_dim,)
-            v_t:   vecteur de vitesse egocentrique, shape (2,)
-            train: si True, effectue l'apprentissage hebbien
+            s_t:            stimulus sensoriel, shape (input_dim,)
+            v_t:            vecteur de vitesse egocentrique, shape (2,)
+            train:          si True, effectue l'apprentissage hebbien
+            gamma_override: γ effectif depuis gamma_surprise(), calculé dans
+                            train.py à partir de la surprise du pas précédent.
+                            Propagé à chaque SingleColumn.step() → SpatialPooler.
+                            None → schedule temporel pur (rétro-compatible).
 
         Returns:
             dict avec :
@@ -396,6 +420,7 @@ class CorticalColumn(nn.Module):
                 all_sdrs:   liste des K SDRs, chacun shape (n_sdr,)
                 all_phases: liste des K phases, chacun shape (n_modules, 2)
                 vote_stats: statistiques du vote de consensus
+                surprise:   ε_t moyen sur les K colonnes ∈ [0,1]
         """
         all_sdrs = []
         all_phases = []
@@ -404,10 +429,11 @@ class CorticalColumn(nn.Module):
         all_allo_phases = []
         all_actives = []
         all_sdrs_predicted = []   # prédictions causales (une par colonne)
+        all_surprises = []        # ε_t par colonne (moyenne ensuite)
 
         # ── Étapes 0–4 pour chaque colonne ───────────────────────────────
         for col in self.columns:
-            result = col.step(s_t, v_t, train=train)
+            result = col.step(s_t, v_t, train=train, gamma_override=gamma_override)
             all_sdrs.append(result["sdr"])
             all_sdrs_predicted.append(result["sdr_predicted"])
             all_phases.append(result["phase"])
@@ -415,6 +441,7 @@ class CorticalColumn(nn.Module):
             all_grid_codes.append(result["grid_code"])
             all_allo_phases.append(result["allo_phase"])
             all_actives.append(result["active"])
+            all_surprises.append(result["surprise"])
 
         # ── Vote inter-colonnes (Phase 2 CMP) ────────────────────────────
         vote_sdr = None
@@ -456,6 +483,9 @@ class CorticalColumn(nn.Module):
             all_sdrs_predicted
         )["consensus"]
 
+        # Surprise moyenne sur les K colonnes (signal de plasticité global)
+        mean_surprise = float(sum(all_surprises) / max(len(all_surprises), 1))
+
         return {
             "sdr":              all_sdrs[0],
             "sdr_predicted":    all_sdrs_predicted[0],          # col. 0, prédiction causale
@@ -468,7 +498,8 @@ class CorticalColumn(nn.Module):
             "all_phases":       all_phases,
             "all_grid_codes":   all_grid_codes,
             "vote_stats":       vote_stats,
-            "vote_sdr":         vote_sdr,   # None si enable_vote=False
+            "vote_sdr":         vote_sdr,       # None si enable_vote=False
+            "surprise":         mean_surprise,  # ε_t moyen ∈ [0,1]
         }
 
     def step_batch(

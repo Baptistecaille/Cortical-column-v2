@@ -151,6 +151,13 @@ class SpatialPooler(nn.Module):
         # ── Compteur de pas (buffer, pas Parameter) ───────────────────────
         self.register_buffer("t_step", torch.tensor(0, dtype=torch.long))
 
+        # ── Estimateur roulant de la surprise (pour gamma_surprise) ──────
+        # EMA min/max de ε_t sur ~1000 pas (alpha=0.001).
+        # Initialisés à 0 : détectés comme "non calibrés" dans gamma_surprise().
+        # Ne deviennent actifs qu'après le newborn stage.
+        self.register_buffer("surprise_min", torch.tensor(0.0))
+        self.register_buffer("surprise_max", torch.tensor(0.0))
+
         # ── Topologie des colonnes pour boost homeöstatique ───────────────
         side = int(math.isqrt(n_columns))
         assert side * side == n_columns, (
@@ -209,6 +216,97 @@ class SpatialPooler(nn.Module):
     def gamma(self) -> float:
         """γ(t) ∈ [0,1], schedule linéaire par morceaux. Réf. §7.2."""
         return float(self._gamma_tensor().item())
+
+    # ── Annealing modulé par la surprise (Predictive Coding) ─────────────
+
+    @torch.no_grad()
+    def gamma_surprise(self, surprise: float, lambda_mix: float = 0.5) -> float:
+        """
+        γ effectif modulé par la surprise de prédiction — Rao & Ballard 1999.
+
+        Principe : le taux d'apprentissage doit être proportionnel à l'erreur
+        de prédiction résiduelle. Quand le modèle prédit bien (surprise faible),
+        les permanences se consolident (γ bas). Quand il est surpris (surprise
+        élevée), la plasticité reste forte pour corriger le modèle interne.
+
+        Formule :
+            γ_surprise = γ_floor + (1 - γ_floor) · ε_norm
+            γ_effectif = λ · γ_temporel(t) + (1 - λ) · γ_surprise
+
+        où ε_norm ∈ [0,1] est la surprise normalisée par l'estimateur roulant
+        (EMA min/max) sur les 1000 derniers pas.
+
+        Pendant le newborn stage (t < newborn_steps) : γ_effectif = 1.0
+        inconditionnellement — la surprise n'est pas encore calibrée.
+
+        Connexion biologique :
+            Correspond à la modulation du taux d'apprentissage par la précision
+            des prédictions dans la free energy minimization de Friston (2005).
+            Le signal ε_t est calculé depuis sdr_predicted vs sdr_observed dans
+            CorticalColumn.step() et transmis ici à chaque pas d'entraînement.
+
+        Connexion avec Lee 2025 (pe_circuits.py) :
+            ε_t = ||PE+||₁ + ||PE-||₁  (somme des erreurs signées)
+            Ce signal est déjà calculé dans PECircuits.step_with_update() et
+            peut être récupéré via pe_circuits.pe_plus / pe_circuits.pe_minus.
+
+        Args:
+            surprise:    ε_t ∈ [0, 1] — erreur de prédiction courante.
+                         Calcul recommandé dans train.py :
+                             s0, s1 = result["sdr"], result["sdr_predicted"]
+                             inter  = (s0 * s1).sum()
+                             union  = ((s0 + s1) > 0).sum()
+                             surprise = 1.0 - float(inter / union.clamp(min=1))
+            lambda_mix:  poids du schedule temporel vs signal de surprise.
+                         λ=1.0 → schedule pur (comportement actuel).
+                         λ=0.0 → surprise pure (pas de décroissance temporelle).
+                         λ=0.5 → équilibre (défaut recommandé).
+
+        Returns:
+            γ_eff ∈ [gamma_floor, 1.0]
+
+        Réf. : Rao & Ballard 1999 (predictive coding), Friston 2005
+               (free energy minimization), §7.2 Formalisation_Mille_Cerveaux.pdf
+        """
+        # Newborn stage : plasticité maximale inconditionnelle.
+        # La surprise n'est pas encore calibrée (W_pred non entraîné).
+        if self.t_step.item() < self.newborn_steps:
+            return 1.0
+
+        # Mise à jour EMA min/max de la surprise (running estimator robuste).
+        # α=0.001 → fenêtre effective ~1000 pas (cohérente avec duty_cycle EMA).
+        alpha_ema = 0.001
+        s = float(surprise)
+        s_min = float(self.surprise_min.item())
+        s_max = float(self.surprise_max.item())
+
+        # EMA séparés pour min et max : convergence vers les extrêmes observés.
+        # min track par α (attraction vers 0), max track vers le haut.
+        new_min = s_min + alpha_ema * (s - s_min) if s < s_min else s_min * (1 - alpha_ema) + s * alpha_ema
+        new_max = s_max + alpha_ema * (s - s_max) if s > s_max else s_max * (1 - alpha_ema) + s * alpha_ema
+
+        # Initialisation au premier pas post-newborn
+        if s_min == 0.0 and s_max == 0.0:
+            new_min = max(0.0, s - 0.1)
+            new_max = min(1.0, s + 0.1)
+
+        self.surprise_min.fill_(max(0.0, new_min))
+        self.surprise_max.fill_(min(1.0, new_max))
+
+        # Normalisation robuste dans [0, 1]
+        s_range = max(float(self.surprise_max.item()) - float(self.surprise_min.item()), 1e-6)
+        s_norm = max(0.0, min(1.0, (s - float(self.surprise_min.item())) / s_range))
+
+        # γ_surprise : haute surprise → plasticité forte, basse → consolidation
+        gamma_floor = self.gamma_floor
+        g_surprise = gamma_floor + (1.0 - gamma_floor) * s_norm
+
+        # Mélange avec le schedule temporel (prior de régularisation)
+        g_temporal = self.gamma()
+        g_eff = lambda_mix * g_temporal + (1.0 - lambda_mix) * g_surprise
+
+        # Le plancher est toujours respecté (plasticité résiduelle permanente)
+        return float(max(gamma_floor, min(1.0, g_eff)))
 
     # ── Boost homeöstatique ───────────────────────────────────────────────
 
@@ -278,17 +376,26 @@ class SpatialPooler(nn.Module):
     # ── Hebbian — interface simple (1 sample) ────────────────────────────
 
     @torch.no_grad()
-    def hebbian_update(self, x: torch.Tensor, active: torch.Tensor) -> None:
+    def hebbian_update(
+        self,
+        x: torch.Tensor,
+        active: torch.Tensor,
+        gamma_override: float | None = None,
+    ) -> None:
         """
         Met à jour les permanences hebbienement (1 sample).
 
         Délègue à hebbian_update_batch() pour cohérence.
 
         Args:
-            x:      SDR binaire, shape (n_inputs,)
-            active: indices actifs, shape (k,)
+            x:             SDR binaire, shape (n_inputs,)
+            active:        indices actifs, shape (k,)
+            gamma_override: γ effectif externe (depuis gamma_surprise()).
+                            None → schedule temporel pur.
         """
-        self.hebbian_update_batch(x.unsqueeze(0), active.unsqueeze(0))
+        self.hebbian_update_batch(
+            x.unsqueeze(0), active.unsqueeze(0), gamma_override=gamma_override
+        )
 
     # ── Hebbian — interface batché (GPU-optimisé) ────────────────────────
 
@@ -297,6 +404,7 @@ class SpatialPooler(nn.Module):
         self,
         x_batch: torch.Tensor,
         active_batch: torch.Tensor,
+        gamma_override: float | None = None,
     ) -> None:
         """
         Met à jour les permanences sur un batch — zéro boucle Python.
@@ -312,11 +420,17 @@ class SpatialPooler(nn.Module):
         Réf. math : §2.5, Éq. 2.9.
 
         Args:
-            x_batch:      SDRs binaires, shape (B, n_inputs)
-            active_batch: indices actifs, shape (B, k)
+            x_batch:       SDRs binaires, shape (B, n_inputs)
+            active_batch:  indices actifs, shape (B, k)
+            gamma_override: si fourni, remplace γ(t) du schedule temporel.
+                            Permet d'injecter γ_effectif depuis gamma_surprise()
+                            dans la boucle d'entraînement de train.py.
+                            None → comportement standard (schedule pur).
         """
         B = x_batch.shape[0]
-        g = self._gamma_tensor()
+        g = self._gamma_tensor() if gamma_override is None else torch.tensor(
+            float(gamma_override), dtype=torch.float32, device=x_batch.device
+        )
         # δ⁻(t) = δ_floor + (δ⁻ − δ_floor) · γ(t)
         # Plancher non nul pour éviter la dérive de p̄ quand γ→0 (§7.2).
         # Sans ce plancher, la dépression s'annule et les permanences dérivent
