@@ -3,8 +3,8 @@ Test du CorticalColumn World Model sur MNIST — version GPU-optimisée.
 
 Pipeline :
     1. Chargement MNIST (28×28 = 784 dims)
-    2. Entraînement hebbien batché via step_batch() — matmuls vectorisés
-    3. Extraction des représentations (SDR + grid code)
+    2. Entraînement hebbien par lots via step_batch()
+    3. Extraction des représentations (SDR + grid code réel)
     4. Évaluation : 6 métriques + linear probing
     5. Rapport + comparaison CPU vs GPU
 
@@ -106,10 +106,11 @@ def train_hebbian(
     log_every_batches: int = 50,
 ) -> float:
     """
-    Entraînement hebbien batché via step_batch().
+    Entraînement hebbien par lots via step_batch().
 
-    Toutes les opérations critiques (SDRSpace + SpatialPooler) s'exécutent
-    en mode batch sur GPU — zéro boucle Python sur les images.
+    Chaque sample du batch traverse désormais le chemin complet du modèle
+    (SDRSpace, SpatialPooler, Layer6b, GridCell, consensus, PE circuits),
+    tout en restant simple à benchmarker.
 
     Args:
         model:              CorticalColumn (sur device)
@@ -195,11 +196,8 @@ def extract_representations(
         sdr_b = result["sdr_batch"].float().cpu()     # (B, n_sdr)
 
         if use_grid_code:
-            # Grid code via step() séquentiel (état temporel nécessaire)
-            # Pour cohérence avec les résultats précédents, on concatène
-            # un vecteur nul (grid code non entraîné sur MNIST)
-            gc_dim = 4 * model.n_grid_modules
-            gc_b = torch.zeros(sdr_b.shape[0], gc_dim)
+            # Grid code réel renvoyé par step_batch() pour la colonne 0
+            gc_b = result["grid_code_batch"].float().cpu()
             reprs_b = torch.cat([sdr_b, gc_b], dim=-1)
         else:
             reprs_b = sdr_b

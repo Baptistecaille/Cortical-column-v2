@@ -19,7 +19,6 @@ Réf. math : §3, Déf. 3.1 — Formalisation_Mille_Cerveaux.pdf
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Tuple
 
 
@@ -133,8 +132,10 @@ class Layer6bTransformer(nn.Module):
         # ── Boucle thalamique ─────────────────────────────────────────────
         self.thalamic_loop = ThalamicLoop(dim=self.phase_dim)
 
-        # ── Normalisation pour garantir l'isométrie (I3.1) ───────────────
-        self.layer_norm = nn.LayerNorm(self.phase_dim)
+        # ── Projection sur la sphère de norme constante (I3.1) ───────────
+        # La sortie est renormalisée pour conserver la norme du latent
+        # avant correction thalamique.
+        self.norm_eps = 1e-8
 
     def _rotation_matrix(self, theta: torch.Tensor) -> torch.Tensor:
         """
@@ -196,8 +197,14 @@ class Layer6bTransformer(nn.Module):
         # Intégration du feedback thalamique
         z_allo_flat = z_allo_flat + 0.1 * feedback   # gain thalamique modéré
 
-        # Normalisation : garantie d'isométrie (I3.1)
-        z_allo_flat = self.layer_norm(z_allo_flat)
+        # Renormalisation : la norme finale doit rester celle du latent
+        # après rotation, qui est identique à celle de l'encodage ego.
+        target_norm = z_ego.norm().item()
+        current_norm = z_allo_flat.norm().item()
+        if current_norm > self.norm_eps and target_norm > self.norm_eps:
+            z_allo_flat = z_allo_flat * (target_norm / current_norm)
+        elif target_norm <= self.norm_eps:
+            z_allo_flat = torch.zeros_like(z_allo_flat)
 
         return z_allo_flat  # (2 × n_grid_modules,) — JAMAIS .mean()
 

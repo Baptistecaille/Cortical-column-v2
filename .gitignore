@@ -1,1 +1,50 @@
 /data
+/__pycache__
+**/__pycache__/
+
+# Python bytecode / caches
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build / packaging temp
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Logs / runtime temp files
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*.pid
+
+# Notebook / Jupyter temp
+.ipynb_checkpoints/
+
+# OS-specific temporary files
+.DS_Store
+Thumbs.db
+
+# IDE/editor temp folders
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json

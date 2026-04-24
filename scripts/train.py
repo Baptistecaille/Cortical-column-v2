@@ -28,6 +28,7 @@ import torch
 import argparse
 import logging
 import time
+import subprocess
 from typing import List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -255,7 +256,7 @@ def main() -> None:
         k_active=args.k_active,
         n_grid_modules=args.n_grid_modules,
         grid_periods=[3, 5, 7, 11, 13, 17][:args.n_grid_modules],
-        consensus_threshold=0.75,
+        consensus_threshold=1.0,
         sp_kwargs={
             "newborn_steps":      newborn_steps,
             "tau_decay":          tau_decay,
@@ -277,7 +278,11 @@ def main() -> None:
 
     # Vérification des invariants
     logger.info("Lancement de la vérification des invariants...")
-    os.system(f"python {os.path.dirname(os.path.abspath(__file__))}/run_invariants.py")
+    invariants_script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "run_invariants.py",
+    )
+    subprocess.run([sys.executable, invariants_script], check=True)
 
     # Chargement MNIST
     logger.info(f"Chargement MNIST ({args.n_images} images)...")

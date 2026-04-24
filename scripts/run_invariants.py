@@ -136,6 +136,8 @@ def test_layer6b(verbose: bool = False) -> bool:
     sdr[:40] = 1.0
     v_t = torch.randn(2) * 0.1
 
+    z_ego = layer6b.encoder(sdr.float()).reshape(layer6b.n_grid_modules, 2)
+    latent_norm = z_ego.norm().item()
     out = layer6b.transform(sdr, v_t)
 
     # I3.1 : sortie de dimension correcte (2 × n_modules)
@@ -146,10 +148,14 @@ def test_layer6b(verbose: bool = False) -> bool:
     not_scalar = (out.dim() == 1 and out.shape[0] > 1)
     all_ok &= check("I3.1 : sortie vectorielle (pas scalaire)", not_scalar)
 
-    # Norme non-nulle (représentation non-dégénérée)
+    # I3.1 : la norme finale reste celle du latent d'entrée
     norm = out.norm().item()
-    norm_ok = norm > 1e-6
-    all_ok &= check(f"I3.1 : ||sortie|| > 0", norm_ok, f"norm = {norm:.6f}")
+    norm_ok = math.isclose(norm, latent_norm, rel_tol=1e-4, abs_tol=1e-5)
+    all_ok &= check(
+        "I3.1 : ||sortie|| = ||latent||",
+        norm_ok,
+        f"||sortie||={norm:.6f}, ||latent||={latent_norm:.6f}",
+    )
 
     return all_ok
 
@@ -338,6 +344,21 @@ def test_cortical_column(verbose: bool = False) -> bool:
     # K colonnes dans all_sdrs
     k_ok = (len(result["all_sdrs"]) == 4)
     all_ok &= check("K = 4 colonnes indépendantes", k_ok)
+
+    # step_batch expose aussi les codes de grille et les prédictions
+    batch_result = model.step_batch(torch.randn(2, 128), train=False)
+    grid_ok = "grid_code_batch" in batch_result and batch_result["grid_code_batch"].shape[0] == 2
+    all_ok &= check(
+        "step_batch retourne grid_code_batch",
+        grid_ok,
+        f"shape = {batch_result.get('grid_code_batch').shape if 'grid_code_batch' in batch_result else 'absent'}",
+    )
+    pred_ok = "sdr_predicted_batch" in batch_result and batch_result["sdr_predicted_batch"].shape[0] == 2
+    all_ok &= check(
+        "step_batch retourne sdr_predicted_batch",
+        pred_ok,
+        f"shape = {batch_result.get('sdr_predicted_batch').shape if 'sdr_predicted_batch' in batch_result else 'absent'}",
+    )
 
     return all_ok
 

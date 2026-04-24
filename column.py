@@ -35,13 +35,10 @@ class SingleColumn(nn.Module):
     transformateur L6b — pas de partage de poids au sens de I6.1.
 
     Note sur SDRSpace (encodeur L4) :
-        SDRSpace peut être partagé entre colonnes (shared_sdr_space).
-        Biologiquement, L4 reçoit l'entrée thalamique commune ; ce sont
-        les minicolonnes L2/3 (SpatialPooler) qui sont spécialisées.
-        I6.1 concerne les permanences SP, pas la projection sensorielle.
-        Sans encodeur partagé, les colonnes projettent le même stimulus
-        dans des espaces orthogonaux → overlap structurel ~0 → consensus
-        vide quelle que soit la durée d'entraînement.
+        Chaque colonne possède son propre SDRSpace par défaut pour que
+        le consensus inter-colonnes observe une vraie diversité de vues.
+        Biologiquement, cela revient à des projections L4 spécialisées
+        par colonne plutôt qu'à un encodeur strictement partagé.
 
     Prédiction causale (predictive coding) :
         À chaque pas t, AVANT d'encoder s_t, la colonne génère un SDR prédit
@@ -199,6 +196,7 @@ class SingleColumn(nn.Module):
         allo_phase = self.layer6b.transform(sdr_active_dense, v_t)  # (2·n_mod,)
 
         # Module 4 — Intégration de chemin via vitesse directe (I4.1, I4.2)
+        prev_phase = self.grid_cell.phases.clone()
         phase = self.grid_cell.integrate(v_t)               # (n_modules, 2)
         grid_code = self.grid_cell.get_code()               # (4·n_modules,)
 
@@ -230,6 +228,7 @@ class SingleColumn(nn.Module):
             "sdr_predicted": sdr_predicted,   # prédiction causale (t-1 → t)
             "active":        active,
             "allo_phase":    allo_phase,
+            "prev_phase":    prev_phase,
             "phase":         phase,
             "grid_code":     grid_code,
         }
@@ -287,14 +286,7 @@ class CorticalColumn(nn.Module):
         self.enable_vote = enable_vote
         self.alpha_divergence = alpha_divergence
 
-        # Encodeur sensoriel partagé entre toutes les colonnes (L4 / SDRSpace).
-        # I6.1 est respecté : l'invariant concerne les permanences SP (L2/3),
-        # pas la projection sensorielle thalamique (L4).
-        # Sans partage : chaque colonne encode s_t dans un espace orthogonal
-        # → overlap inter-colonnes structurellement ~0 → consensus vide.
-        self.shared_sdr_space = SDRSpace(input_dim=input_dim, n=n_sdr, w=w)
-
-        # K colonnes INDÉPENDANTES (permanences SP, L6b, GridCell) — I6.1
+        # K colonnes INDÉPENDANTES (SDRSpace, permanences SP, L6b, GridCell) — I6.1
         self.columns = nn.ModuleList([
             SingleColumn(
                 input_dim=input_dim,
@@ -306,7 +298,7 @@ class CorticalColumn(nn.Module):
                 grid_periods=grid_periods,
                 pe_lr=pe_lr,
                 pe_lr_pred=pe_lr_pred,
-                shared_sdr_space=self.shared_sdr_space,
+                shared_sdr_space=None,
                 sp_kwargs=sp_kwargs,
             )
             for _ in range(n_columns)
@@ -407,6 +399,7 @@ class CorticalColumn(nn.Module):
         """
         all_sdrs = []
         all_phases = []
+        all_prev_phases = []
         all_grid_codes = []
         all_allo_phases = []
         all_actives = []
@@ -418,6 +411,7 @@ class CorticalColumn(nn.Module):
             all_sdrs.append(result["sdr"])
             all_sdrs_predicted.append(result["sdr_predicted"])
             all_phases.append(result["phase"])
+            all_prev_phases.append(result["prev_phase"])
             all_grid_codes.append(result["grid_code"])
             all_allo_phases.append(result["allo_phase"])
             all_actives.append(result["active"])
@@ -441,10 +435,11 @@ class CorticalColumn(nn.Module):
                 )
 
         # ── Module 5 — Algèbre de déplacement ────────────────────────────
-        # Calculé sur la première colonne (référence)
-        phi_sensor = torch.zeros(self.n_grid_modules, 2, device=s_t.device)
+        # Déplacement courant = phase après intégration vs phase précédente.
+        # Cela fournit un triplet non trivial même sans annotation d'objet.
+        phi_sensor = all_prev_phases[0]
         triplet = self.displacement.make_triplet(
-            sdr_parent=all_sdrs[0],
+            sdr_parent=all_sdrs_predicted[0],
             sdr_subobject=all_sdrs[0],
             phi_object=all_phases[0],
             phi_sensor=phi_sensor,
@@ -479,55 +474,83 @@ class CorticalColumn(nn.Module):
     def step_batch(
         self,
         s_batch: torch.Tensor,
+        v_batch: Optional[torch.Tensor] = None,
         train: bool = True,
+        reset_each_sample: bool = True,
     ) -> dict:
         """
-        Entraînement batché — version GPU-optimisée de step().
+        Entraînement batché — wrapper pratique au-dessus de step().
 
-        Exécute SDRSpace + SpatialPooler en mode batch (matmuls vectorisés),
-        puis calcule le consensus par batch. Layer6b et GridCell (état séquentiel)
-        sont omis ici — utilisés uniquement lors de l'évaluation via step().
-
-        Adapté aux images statiques (MNIST) où la vitesse est nulle et
-        l'intégration de chemin n'est pas nécessaire à l'entraînement.
+        Chaque élément du batch est traité comme un échantillon indépendant.
+        Par défaut, l'état interne est réinitialisé avant chaque sample afin
+        d'exécuter aussi Layer6b, GridCell, DisplacementAlgebra et les PE
+        circuits sur le chemin complet du modèle.
 
         Args:
-            s_batch: stimuli sensoriels, shape (B, input_dim)
-            train:   si True, effectue l'apprentissage hebbien
+            s_batch:          stimuli sensoriels, shape (B, input_dim)
+            v_batch:          vitesses, shape (B, 2). Si None, zéros.
+            train:            si True, effectue l'apprentissage hebbien
+            reset_each_sample:si True, chaque sample démarre d'un état propre
 
         Returns:
             dict avec :
-                sdr_batch:       SDRs col. 0, shape (B, n_sdr)
-                consensus_batch: SDR de consensus AND, shape (B, n_sdr)
-                all_sdr_batches: liste des K tenseurs (B, n_sdr)
+                sdr_batch:          SDRs col. 0, shape (B, n_sdr)
+                sdr_predicted_batch: prédictions col. 0, shape (B, n_sdr)
+                phase_batch:        phases col. 0, shape (B, n_modules, 2)
+                grid_code_batch:    grid codes col. 0, shape (B, 4·n_modules)
+                consensus_batch:    consensus AND, shape (B, n_sdr)
+                all_sdr_batches:    liste des K tenseurs (B, n_sdr)
+                all_grid_code_batches: liste des K tenseurs (B, 4·n_modules)
         """
         B = s_batch.shape[0]
-        all_sdr_batches = []
+        if v_batch is None:
+            v_batch = torch.zeros(B, 2, device=s_batch.device, dtype=s_batch.dtype)
+        if v_batch.shape != (B, 2):
+            raise ValueError(
+                f"v_batch.shape={tuple(v_batch.shape)} doit être {(B, 2)}"
+            )
 
-        for col in self.columns:
-            # Module 1 — SDRSpace (batch natif)
-            sdr_batch = col.sdr_space.encode(s_batch)          # (B, n_sdr)
+        sample_results = []
+        for i in range(B):
+            if reset_each_sample:
+                self.reset()
+            sample_results.append(
+                self.step(s_batch[i], v_batch[i], train=train)
+            )
 
-            # Module 2 — SpatialPooler (batch, GPU-friendly)
-            active_batch = col.spatial_pooler.forward_batch(sdr_batch)  # (B, k)
+        sdr_batch = torch.stack(
+            [r["sdr"] for r in sample_results], dim=0
+        )
+        sdr_predicted_batch = torch.stack(
+            [r["sdr_predicted"] for r in sample_results], dim=0
+        )
+        phase_batch = torch.stack(
+            [r["phase"] for r in sample_results], dim=0
+        )
+        consensus_batch = torch.stack(
+            [r["consensus"] for r in sample_results], dim=0
+        )
+        grid_code_batch = torch.stack(
+            [r["all_grid_codes"][0] for r in sample_results], dim=0
+        )
 
-            if train:
-                col.spatial_pooler.hebbian_update_batch(sdr_batch, active_batch)
-
-            all_sdr_batches.append(sdr_batch)
-
-        # Module 6 — Consensus AND par batch
-        # sdr_stack : (K, B, n_sdr) → vote_fraction : (B, n_sdr)
-        sdr_stack = torch.stack(all_sdr_batches, dim=0).float()
-        vote_fraction = sdr_stack.mean(dim=0)
-        consensus_batch = (
-            vote_fraction >= self.consensus.consensus_threshold
-        ).float()
+        all_sdr_batches = [
+            torch.stack([r["all_sdrs"][c] for r in sample_results], dim=0)
+            for c in range(self.n_columns)
+        ]
+        all_grid_code_batches = [
+            torch.stack([r["all_grid_codes"][c] for r in sample_results], dim=0)
+            for c in range(self.n_columns)
+        ]
 
         return {
-            "sdr_batch": all_sdr_batches[0],
+            "sdr_batch": sdr_batch,
+            "sdr_predicted_batch": sdr_predicted_batch,
+            "phase_batch": phase_batch,
+            "grid_code_batch": grid_code_batch,
             "consensus_batch": consensus_batch,
             "all_sdr_batches": all_sdr_batches,
+            "all_grid_code_batches": all_grid_code_batches,
         }
 
     def reset(self) -> None:
