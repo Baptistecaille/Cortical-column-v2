@@ -28,7 +28,7 @@ Réf. : Lee 2025, §2 — Formalisation_Mille_Cerveaux.pdf §6
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Optional, Tuple, TYPE_CHECKING
 
 
 class PECircuits(nn.Module):
@@ -217,6 +217,88 @@ class PECircuits(nn.Module):
             - self.calcium_gate(self.r_Ls_neg)
         )
         return learning_rate * torch.outer(error_net, pre)
+
+    # ── Versions batchées (B épisodes indépendants en parallèle) ─────────
+
+    @torch.no_grad()
+    def step_with_update_batch(
+        self,
+        x_batch: torch.Tensor,
+        context_batch: torch.Tensor,
+        r_pos_batch: torch.Tensor,
+        r_neg_batch: torch.Tensor,
+        lr_pred: float = 0.01,
+        dt: float = 1.0,
+    ) -> "Tuple[torch.Tensor, torch.Tensor]":
+        """
+        Pas PE pour B échantillons indépendants — états PE passés explicitement.
+
+        Le prédicteur est mis à jour par la règle delta moyennée sur le batch
+        (équivalent à traiter B images séquentiellement avec le même lr).
+        Les états PE r_pos/r_neg sont retournés sans muter les buffers.
+
+        Args:
+            x_batch:       SDRs courants, shape (B, dim)
+            context_batch: grid_codes top-down, shape (B, context_dim)
+            r_pos_batch:   état PE+ courant, shape (B, dim)
+            r_neg_batch:   état PE− courant, shape (B, dim)
+            lr_pred:       taux d'apprentissage du prédicteur
+            dt:            pas de temps
+
+        Returns:
+            new_r_pos: shape (B, dim)
+            new_r_neg: shape (B, dim)
+        """
+        predicted = self.predictor(context_batch)            # (B, dim)
+        error     = x_batch - predicted                       # (B, dim)
+        pe_pos    = F.relu(error)                             # (B, dim)
+        pe_neg    = F.relu(-error)                            # (B, dim)
+
+        # Mise à jour du prédicteur — règle delta moyennée sur le batch
+        # ΔW = lr · (1/B) · erreurᵀ @ contexte  (produit externe moyenné)
+        B = x_batch.shape[0]
+        self.predictor.weight.data.add_(
+            lr_pred * (error.T @ context_batch) / B
+        )
+        self.predictor.bias.data.add_(lr_pred * error.mean(dim=0))
+
+        # Filtre passe-bas sur les états PE+/PE− — sans mutation du buffer
+        alpha_pos = dt / self.tau_pos
+        alpha_neg = dt / self.tau_neg
+        new_r_pos = (1.0 - alpha_pos) * r_pos_batch + alpha_pos * pe_pos
+        new_r_neg = (1.0 - alpha_neg) * r_neg_batch + alpha_neg * pe_neg
+
+        return new_r_pos, new_r_neg
+
+    @torch.no_grad()
+    def modulated_update_batch(
+        self,
+        pre_batch: torch.Tensor,
+        r_pos_batch: torch.Tensor,
+        r_neg_batch: torch.Tensor,
+        learning_rate: float = 0.001,
+    ) -> torch.Tensor:
+        """
+        ΔW_enc batché via l'erreur PE signée, moyennée sur B.
+
+        ΔW = η · (1/B) · (Ca(PE+) − Ca(PE−))ᵀ @ pre_batch
+
+        Réf. : Lee 2025, Éq. 6.
+
+        Args:
+            pre_batch:    vecteurs pré-synaptiques (s_t), shape (B, input_dim)
+            r_pos_batch:  états PE+, shape (B, dim)
+            r_neg_batch:  états PE−, shape (B, dim)
+            learning_rate: η
+
+        Returns:
+            delta_W: shape (dim, input_dim) = shape de W_enc.weight
+        """
+        error_net = (
+            self.calcium_gate(r_pos_batch)
+            - self.calcium_gate(r_neg_batch)
+        )                                                     # (B, dim)
+        return learning_rate * (error_net.T @ pre_batch) / pre_batch.shape[0]
 
     # ── Compatibilité (ancien step, sans mise à jour prédicteur) ─────────
 

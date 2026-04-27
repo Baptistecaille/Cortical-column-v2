@@ -496,8 +496,12 @@ def main() -> None:
     ).to(device)
 
     if args.checkpoint:
-        model.load_state_dict(torch.load(args.checkpoint, map_location=device))
-        print(f"[OK] Checkpoint chargé : {args.checkpoint}")
+        if not os.path.isfile(args.checkpoint):
+            print(f"[ERREUR] Checkpoint introuvable : {args.checkpoint}")
+            print("[INFO] Lancement avec un modèle non entraîné (poids aléatoires)")
+        else:
+            model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+            print(f"[OK] Checkpoint chargé : {args.checkpoint}")
 
     ds = torchvision.datasets.MNIST(
         root=args.data_dir, train=False, download=True,

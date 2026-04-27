@@ -261,6 +261,122 @@ class SingleColumn(nn.Module):
         }
 
 
+    @torch.no_grad()
+    def step_batch_external(
+        self,
+        s_batch: torch.Tensor,
+        v_batch: torch.Tensor,
+        ext_state: dict,
+        train: bool = True,
+        gamma_override: Optional[float] = None,
+    ) -> tuple:
+        """
+        Traitement de B épisodes indépendants en parallèle via état externe.
+
+        Toute la pipeline SDR→SP→L6b→GC→PE est vectorisée sur B.
+        L'état externe (prev_grid_code, h_tc, phases, r_pos, r_neg) est passé
+        explicitement et retourné mis à jour — aucune mutation de buffer.
+        Cela permet de maintenir B flux d'états indépendants avec un seul jeu
+        de poids partagés (parcimonie GPU maximale).
+
+        Convention de parcimonie pour la mise à jour hebbienne :
+            hebbian_update_batch accumule les gradients de B images dans une
+            seule mise à jour de permanence (équivalent à B pas séquentiels).
+
+        Args:
+            s_batch:         stimuli, shape (B, input_dim)
+            v_batch:         vitesses, shape (B, 2)
+            ext_state:       dict avec clés :
+                               prev_grid_code (B, 4·n_modules)
+                               h_tc           (B, 2·n_modules)
+                               phases         (B, n_modules, 2)
+                               r_pos          (B, n_sdr)
+                               r_neg          (B, n_sdr)
+            train:           si True, effectue les mises à jour hebbienne et PE
+            gamma_override:  γ effectif depuis gamma_surprise() (None = schedule pur)
+
+        Returns:
+            (results_batch, new_ext_state)
+            results_batch:  dict avec sdr (B,n_sdr), sdr_predicted (B,n_sdr),
+                            active (B,k), allo_phase (B,phase_dim),
+                            prev_phases (B,n_mod,2), phases (B,n_mod,2),
+                            grid_code (B,4·n_mod), surprise (B,)
+            new_ext_state:  dict mis à jour (même structure qu'ext_state)
+        """
+        B = s_batch.shape[0]
+        device = s_batch.device
+
+        # ── Étape 0 : prédiction causale depuis prev_grid_code ────────────
+        logits = self.pe_circuits.predictor(ext_state["prev_grid_code"])   # (B, n_sdr)
+        _, top_idx = torch.topk(logits, self.spatial_pooler.k, dim=-1, sorted=False)
+        sdr_predicted = torch.zeros(B, self.n_sdr, device=device)
+        sdr_predicted.scatter_(1, top_idx, 1.0)                            # (B, n_sdr)
+
+        # ── Module 1 : encodage SDR ──────────────────────────────────────
+        sdr = self.sdr_space.encode(s_batch)                               # (B, n_sdr)
+
+        # ── Module 2 : sélection de colonnes ────────────────────────────
+        active = self.spatial_pooler.forward_batch(sdr)                    # (B, k)
+
+        # SDR actif dense (B, n_sdr)
+        sdr_active_dense = torch.zeros(B, self.n_sdr, device=device)
+        sdr_active_dense.scatter_(1, active, 1.0)
+
+        # ── Module 3 : transformation ego→allo ──────────────────────────
+        allo_phase, new_h_tc = self.layer6b.transform_batch(
+            sdr_active_dense, v_batch, ext_state["h_tc"]
+        )                                                                   # (B, phase_dim)
+
+        # ── Module 4 : intégration de chemin ────────────────────────────
+        prev_phases = ext_state["phases"]
+        new_phases, grid_code = self.grid_cell.integrate_batch(
+            v_batch, ext_state["phases"]
+        )                                                                   # (B, n_mod, 2), (B, 4·n_mod)
+
+        # ── Surprise : Jaccard complement, par échantillon ───────────────
+        inter    = (sdr_predicted * sdr).sum(dim=-1)                       # (B,)
+        union    = ((sdr_predicted + sdr) > 0).float().sum(dim=-1).clamp(min=1.0)
+        surprise = 1.0 - inter / union                                     # (B,)
+
+        # ── Apprentissage ────────────────────────────────────────────────
+        if train:
+            self.spatial_pooler.hebbian_update_batch(
+                sdr, active, gamma_override=gamma_override
+            )
+            new_r_pos, new_r_neg = self.pe_circuits.step_with_update_batch(
+                sdr.float(), grid_code,
+                ext_state["r_pos"], ext_state["r_neg"],
+                lr_pred=self.pe_lr_pred,
+            )
+            delta_W = self.pe_circuits.modulated_update_batch(
+                s_batch.float(), new_r_pos, new_r_neg,
+                learning_rate=self.pe_lr,
+            )
+            self.sdr_space.pe_update(delta_W)
+        else:
+            new_r_pos = ext_state["r_pos"]
+            new_r_neg = ext_state["r_neg"]
+
+        new_state = {
+            "prev_grid_code": grid_code,
+            "h_tc":           new_h_tc,
+            "phases":         new_phases,
+            "r_pos":          new_r_pos,
+            "r_neg":          new_r_neg,
+        }
+        results = {
+            "sdr":           sdr,
+            "sdr_predicted": sdr_predicted,
+            "active":        active,
+            "allo_phase":    allo_phase,
+            "prev_phases":   prev_phases,
+            "phases":        new_phases,
+            "grid_code":     grid_code,
+            "surprise":      surprise,
+        }
+        return results, new_state
+
+
 class CorticalColumn(nn.Module):
     """
     Ensemble de K colonnes corticales indépendantes avec consensus.
@@ -526,6 +642,141 @@ class CorticalColumn(nn.Module):
             "vote_sdr":         vote_sdr,       # None si enable_vote=False
             "surprise":         mean_surprise,  # ε_t moyen ∈ [0,1]
         }
+
+    def make_batch_state(self, B: int, device: torch.device) -> List[dict]:
+        """
+        Alloue les états externes initiaux pour B épisodes indépendants.
+
+        Appeler avant chaque nouveau lot d'épisodes (équivalent à reset() pour
+        le mode séquentiel). Les phases sont initialisées aléatoirement sur 𝕋²
+        comme dans GridCellNetwork.reset().
+
+        Args:
+            B:      taille de lot (nombre d'épisodes indépendants)
+            device: device cible (cpu/cuda)
+
+        Returns:
+            Liste de K dicts, un par colonne, chacun avec les tenseurs
+            (B, ...) pour prev_grid_code, h_tc, phases, r_pos, r_neg.
+        """
+        states = []
+        for col in self.columns:
+            phase_dim = col.layer6b.phase_dim          # 2 * n_grid_modules
+            n_modules = col.grid_cell.n_modules
+            ctx_dim   = 4 * col.n_grid_modules
+
+            states.append({
+                "prev_grid_code": torch.zeros(B, ctx_dim,           device=device),
+                "h_tc":           torch.zeros(B, phase_dim,         device=device),
+                "phases":         torch.rand (B, n_modules, 2,      device=device) * 2 * math.pi,
+                "r_pos":          torch.zeros(B, col.n_sdr,         device=device),
+                "r_neg":          torch.zeros(B, col.n_sdr,         device=device),
+            })
+        return states
+
+    @torch.no_grad()
+    def step_parallel(
+        self,
+        s_batch: torch.Tensor,
+        v_batch: torch.Tensor,
+        state_batch: List[dict],
+        train: bool = True,
+        gamma_override: Optional[float] = None,
+    ) -> tuple:
+        """
+        Traitement de B épisodes indépendants × K colonnes en parallèle.
+
+        Chaque colonne traite les B images avec step_batch_external() (vectorisé).
+        Les K colonnes sont itérées séquentiellement (poids différents), mais
+        chaque colonne sature le GPU sur B échantillons simultanément.
+
+        Remplace CorticalColumn.step() pour l'entraînement batché.
+
+        Args:
+            s_batch:       stimuli, shape (B, input_dim)
+            v_batch:       vitesses, shape (B, 2)
+            state_batch:   liste de K dicts d'états externes (B, ...)
+            train:         si True, mises à jour hebbienne + PE
+            gamma_override: γ effectif (None = schedule pur)
+
+        Returns:
+            (results, new_state_batch)
+            results contient :
+                sdr       (B, n_sdr)  — première colonne
+                consensus (B, n_sdr)  — AND strict
+                all_sdrs  list K × (B, n_sdr)
+                all_grid_codes list K × (B, 4·n_mod)
+                surprise  (B,)        — moyenne sur K colonnes
+        """
+        all_sdrs:          List[torch.Tensor] = []
+        all_sdrs_predicted: List[torch.Tensor] = []
+        all_grid_codes:    List[torch.Tensor] = []
+        all_phases:        List[torch.Tensor] = []
+        all_surprises:     List[torch.Tensor] = []
+        new_states:        List[dict] = []
+
+        for c_idx, col in enumerate(self.columns):
+            res, new_st = col.step_batch_external(
+                s_batch, v_batch, state_batch[c_idx],
+                train=train, gamma_override=gamma_override,
+            )
+            all_sdrs.append(res["sdr"])
+            all_sdrs_predicted.append(res["sdr_predicted"])
+            all_grid_codes.append(res["grid_code"])
+            all_phases.append(res["phases"])
+            all_surprises.append(res["surprise"])
+            new_states.append(new_st)
+
+        # ── Consensus AND strict (I6.2, I6.3) ────────────────────────────
+        # sdr_stack : (K, B, n_sdr) → vote_fraction : (B, n_sdr)
+        sdr_stack    = torch.stack(all_sdrs, dim=0).float()               # (K, B, n_sdr)
+        vote_fraction = sdr_stack.mean(dim=0)                              # (B, n_sdr)
+        consensus    = (vote_fraction >= self.consensus.consensus_threshold).float()
+
+        # ── Prédiction consensus AND strict sur les SDRs prédits ─────────
+        pred_stack    = torch.stack(all_sdrs_predicted, dim=0).float()
+        pred_consensus = (pred_stack.mean(dim=0) >= self.consensus.consensus_threshold).float()
+
+        # ── Surprise moyenne K colonnes ───────────────────────────────────
+        mean_surprise = torch.stack(all_surprises, dim=0).mean(dim=0)     # (B,)
+
+        results = {
+            "sdr":              all_sdrs[0],
+            "sdr_predicted":    all_sdrs_predicted[0],
+            "predicted_consensus": pred_consensus,
+            "consensus":        consensus,
+            "all_sdrs":         all_sdrs,
+            "all_sdrs_predicted": all_sdrs_predicted,
+            "all_grid_codes":   all_grid_codes,
+            "all_phases":       all_phases,
+            "surprise":         mean_surprise,
+        }
+        return results, new_states
+
+    @torch.no_grad()
+    def anchor_batch(
+        self,
+        state_batch: List[dict],
+        initial_phases_batch: List[torch.Tensor],
+        confidence: float = 0.8,
+    ) -> None:
+        """
+        Applique l'ancrage de retour à l'origine sur les B états en parallèle.
+
+        Modifie state_batch["phases"] en place pour chaque colonne.
+
+        Args:
+            state_batch:          K dicts d'états courants
+            initial_phases_batch: K tenseurs (B, n_modules, 2) des phases initiales
+            confidence:           confiance dans le repère ∈ [0, 1]
+        """
+        for c_idx, col in enumerate(self.columns):
+            corrected = col.grid_cell.anchor_batch(
+                state_batch[c_idx]["phases"],
+                initial_phases_batch[c_idx],
+                confidence=confidence,
+            )
+            state_batch[c_idx]["phases"] = corrected
 
     def step_batch(
         self,
