@@ -452,9 +452,12 @@ def main() -> None:
     ).to(device)
 
     if args.checkpoint:
-        state = torch.load(args.checkpoint, map_location=device)
-        model.load_state_dict(state)
-        print(f"[OK] Checkpoint chargé : {args.checkpoint}")
+        if not os.path.isfile(args.checkpoint):
+            print(f"[ERREUR] Checkpoint introuvable : {args.checkpoint}")
+            print("[INFO] Lancement avec un modèle non entraîné (poids aléatoires)")
+        else:
+            model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+            print(f"[OK] Checkpoint chargé : {args.checkpoint}")
     else:
         print("[INFO] Aucun checkpoint — modèle non entraîné (test de structure)")
 
