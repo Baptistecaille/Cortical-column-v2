@@ -13,8 +13,19 @@ Métriques :
 Ces 7 métriques correspondent à l'évaluation non-supervisée définie dans
 CLAUDE.md §3 et le pseudo-algorithme global.
 
+Flags CLI :
+    --eval-prediction  active les Protocoles A et B (prediction_eval.py)
+    --eval-ood         active l'évaluation OOD (generalization_eval.py)
+    --eval-all         active tous les protocoles (équivalent --eval-prediction --eval-ood)
+
 Réf. math : §8 — Formalisation_Mille_Cerveaux.pdf
 """
+
+import sys
+import os
+import argparse
+import json
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -514,3 +525,171 @@ class UnsupervisedEvaluator:
         metrics["SI"] = column_specialization_index(per_column_sdrs)
 
         return metrics
+
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    """
+    Point d'entrée CLI pour l'évaluation complète.
+
+    Flags :
+        --eval-prediction  : active Protocoles A et B
+        --eval-ood         : active l'évaluation OOD
+        --eval-all         : active tous les protocoles
+    """
+    parser = argparse.ArgumentParser(
+        description="Évaluation non-supervisée du CorticalColumn World Model"
+    )
+    parser.add_argument("--dataset",    type=str, default="mnist")
+    parser.add_argument("--data_dir",   type=str, default="./data")
+    parser.add_argument("--n_samples",  type=int, default=100,
+                        help="Nombre d'images pour l'évaluation non-supervisée")
+    parser.add_argument("--n_columns",  type=int, default=4)
+    parser.add_argument("--n_sdr",      type=int, default=2048)
+    parser.add_argument("--w",          type=int, default=40)
+    parser.add_argument("--n_minicolumns", type=int, default=256)
+    parser.add_argument("--k_active",   type=int, default=40)
+    parser.add_argument("--n_grid_modules", type=int, default=6)
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Checkpoint PyTorch (.pt) — si absent, modèle non entraîné")
+    parser.add_argument("--output_dir", type=str, default="./eval_outputs")
+    parser.add_argument("--device",     type=str, default="cpu")
+
+    # ── Flags d'activation des protocoles ────────────────────────────────────
+    parser.add_argument("--eval-prediction", dest="eval_prediction",
+                        action="store_true",
+                        help="Active les Protocoles A et B (prédiction)")
+    parser.add_argument("--eval-ood", dest="eval_ood",
+                        action="store_true",
+                        help="Active l'évaluation OOD")
+    parser.add_argument("--eval-all", dest="eval_all",
+                        action="store_true",
+                        help="Active tous les protocoles (--eval-prediction + --eval-ood)")
+
+    # ── Paramètres spécifiques aux protocoles ─────────────────────────────────
+    parser.add_argument("--n_steps_b",  type=int, default=10,
+                        help="Pas d'inférence pour le Protocole B")
+    parser.add_argument("--n_samples_b", type=int, default=50,
+                        help="Échantillons pour le Protocole B (peut être < n_samples)")
+
+    args = parser.parse_args()
+
+    # Résolution des flags composites
+    run_prediction = args.eval_prediction or args.eval_all
+    run_ood        = args.eval_ood        or args.eval_all
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from column import CorticalColumn
+    import torchvision
+    import torchvision.transforms as T
+
+    device = torch.device(args.device)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Construction du modèle ────────────────────────────────────────────────
+    model = CorticalColumn(
+        n_columns=args.n_columns,
+        input_dim=784,
+        n_sdr=args.n_sdr,
+        w=args.w,
+        n_minicolumns=args.n_minicolumns,
+        k_active=args.k_active,
+        n_grid_modules=args.n_grid_modules,
+        grid_periods=[3, 5, 7, 11, 13, 17][:args.n_grid_modules],
+        consensus_threshold=1.0,
+    ).to(device)
+
+    if args.checkpoint:
+        model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+        print(f"[OK] Checkpoint chargé : {args.checkpoint}")
+    else:
+        print("[INFO] Aucun checkpoint — modèle non entraîné")
+
+    # ── Chargement des images ─────────────────────────────────────────────────
+    ds = torchvision.datasets.MNIST(
+        root=args.data_dir, train=False, download=True,
+        transform=T.ToTensor(),
+    )
+    loader = torch.utils.data.DataLoader(
+        ds, batch_size=args.n_samples, shuffle=False, num_workers=0
+    )
+    imgs_raw, labels = next(iter(loader))
+    imgs = imgs_raw.view(imgs_raw.shape[0], -1).to(device)
+    n = min(args.n_samples, imgs.shape[0])
+    imgs, labels = imgs[:n], labels[:n]
+
+    v_zeros = torch.zeros(n, 2, device=device)
+
+    # ── Évaluation non-supervisée (7 métriques) ───────────────────────────────
+    print("\n[Unsupervised] Évaluation 7 métriques...")
+    evaluator = UnsupervisedEvaluator(model, expected_w=args.w, n_classes=10)
+    metrics = evaluator.evaluate(imgs, v_zeros, labels)
+    print("  Métriques :")
+    for k, v in metrics.items():
+        print(f"    {k:30s} = {v:.4f}" if isinstance(v, float) else f"    {k} = {v}")
+
+    report: Dict = {"unsupervised": metrics}
+
+    # ── Protocoles prédictifs (A + B) ─────────────────────────────────────────
+    if run_prediction:
+        print("\n[Protocole A + B] Évaluation prédictive...")
+        from eval.prediction_eval import (
+            PredictionProtocolA, PredictionProtocolB,
+            _check_protocol_a, _check_protocol_b,
+            plot_protocol_a, plot_protocol_b,
+        )
+
+        proto_a = PredictionProtocolA(model)
+        res_a = proto_a.evaluate(imgs, n_samples=n)
+        report["prediction_A"] = res_a
+        for w in _check_protocol_a(res_a):
+            print(w)
+        plot_protocol_a(res_a, str(out_dir / "prediction_A_curve.png"))
+
+        proto_b = PredictionProtocolB(model, n_steps=args.n_steps_b)
+        n_b = min(args.n_samples_b, n)
+        res_b = proto_b.evaluate(imgs[:n_b], n_samples=n_b)
+        report["prediction_B"] = res_b
+        for w in _check_protocol_b(res_b):
+            print(w)
+        plot_protocol_b(res_b, str(out_dir / "prediction_B_convergence.png"))
+
+    # ── Évaluation OOD ────────────────────────────────────────────────────────
+    if run_ood:
+        print("\n[OOD] Évaluation généralisation hors distribution...")
+        from eval.generalization_eval import (
+            OODEvaluator,
+            plot_ood_accuracy, plot_ood_reconstruction, plot_ood_robustness,
+        )
+
+        ood_eval = OODEvaluator(model, n_classes=10)
+        ood_results = ood_eval.evaluate(imgs, labels, n_samples=n)
+        report["ood"] = ood_results
+
+        for w in ood_eval.check_sanity(ood_results):
+            print(w)
+
+        plot_ood_accuracy(ood_results,
+                          str(out_dir / "ood_accuracy_degradation.png"))
+        plot_ood_reconstruction(ood_results,
+                                str(out_dir / "ood_reconstruction_degradation.png"))
+        plot_ood_robustness(ood_results,
+                            str(out_dir / "ood_robustness_scores.png"))
+
+    # ── Rapport JSON global ───────────────────────────────────────────────────
+    report_path = out_dir / "eval_report.json"
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"\n[OK] Rapport complet → {report_path}")
+
+    if not run_prediction and not run_ood:
+        print("\n[INFO] Pour activer les protocoles prédictifs et OOD :")
+        print("  --eval-prediction   Protocoles A + B")
+        print("  --eval-ood          Généralisation OOD")
+        print("  --eval-all          Tous les protocoles")
+
+
+if __name__ == "__main__":
+    main()
