@@ -30,7 +30,7 @@ Réf. math : §4 — Formalisation_Mille_Cerveaux.pdf
 import torch
 import torch.nn as nn
 import math
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from math import gcd
 from functools import reduce
 
@@ -151,6 +151,55 @@ class GridCellNetwork(nn.Module):
         ).reshape(4 * self.n_modules)
         return code
 
+    # ── Intégration batché ────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def integrate_batch(
+        self,
+        vel_batch: torch.Tensor,
+        phases_batch: torch.Tensor,
+        dt: float = 1.0,
+    ) -> "Tuple[torch.Tensor, torch.Tensor]":
+        """
+        Intègre la vitesse pour B épisodes indépendants en parallèle.
+
+        Contrairement à integrate(), les phases sont passées et retournées
+        explicitement — aucune mutation du buffer self.phases.
+        Cela permet de maintenir B états de phases indépendants.
+
+        Invariant I4.1 : φ_k ∈ [0, 2π)² après mod 2π.
+        Invariant I4.2 : code retourné = [cos φ₀, sin φ₀, cos φ₁, sin φ₁]
+                         par module → dimension 4·n_modules.
+
+        Args:
+            vel_batch:    vitesses 2D, shape (B, 2)
+            phases_batch: phases courantes, shape (B, n_modules, 2)
+            dt:           pas de temps
+
+        Returns:
+            new_phases: shape (B, n_modules, 2)
+            grid_codes: shape (B, 4 * n_modules)
+        """
+        # delta_phi[b, k, :] = R_k_scale[k] * vel_batch[b, :]
+        # R_k_scale : (n_modules,) → (1, n_modules, 1) pour broadcast
+        delta_phi = (
+            self.R_k_scale.view(1, self.n_modules, 1)
+            * vel_batch.float().unsqueeze(1)
+        )                                                    # (B, n_modules, 2)
+
+        new_phases = (phases_batch + dt * delta_phi) % (2 * math.pi)  # (B, n_modules, 2)
+
+        # Code cos/sin : (B, 4*n_modules)
+        phi_0 = new_phases[:, :, 0]                         # (B, n_modules)
+        phi_1 = new_phases[:, :, 1]                         # (B, n_modules)
+        grid_codes = torch.stack(
+            [torch.cos(phi_0), torch.sin(phi_0),
+             torch.cos(phi_1), torch.sin(phi_1)],
+            dim=-1,
+        ).reshape(vel_batch.shape[0], 4 * self.n_modules)   # (B, 4*n_modules)
+
+        return new_phases, grid_codes
+
     # ── Ancrage ───────────────────────────────────────────────────────────
 
     @torch.no_grad()
@@ -188,6 +237,34 @@ class GridCellNetwork(nn.Module):
         delta = (landmark_phases - self.phases + math.pi) % (2 * math.pi) - math.pi
         correction = confidence * weights * delta
         self.phases.data = (self.phases + correction) % (2 * math.pi)
+
+    @torch.no_grad()
+    def anchor_batch(
+        self,
+        phases_batch: torch.Tensor,
+        landmark_batch: torch.Tensor,
+        confidence: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        Ancrage pour B épisodes en parallèle — version fonctionnelle (no buffer).
+
+        Invariant I4.3 : correction pondérée par 1/λ_k (pas uniforme).
+
+        Args:
+            phases_batch:   phases courantes, shape (B, n_modules, 2)
+            landmark_batch: phases cibles,    shape (B, n_modules, 2)
+            confidence:     confiance dans le repère ∈ [0, 1]
+
+        Returns:
+            new_phases: shape (B, n_modules, 2)
+        """
+        # Poids 1/λ_k normalisés : (1, n_modules, 1) pour broadcast sur B et axe 2D
+        weights = (1.0 / self.lambda_k).unsqueeze(-1)   # (n_modules, 1)
+        weights = (weights / weights.sum()).view(1, self.n_modules, 1)  # (1, n_mod, 1)
+
+        delta = (landmark_batch - phases_batch + math.pi) % (2 * math.pi) - math.pi
+        correction = confidence * weights * delta
+        return (phases_batch + correction) % (2 * math.pi)
 
     # ── Utilitaires ───────────────────────────────────────────────────────
 

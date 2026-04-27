@@ -19,7 +19,7 @@ Réf. math : §3, Déf. 3.1 — Formalisation_Mille_Cerveaux.pdf
 
 import torch
 import torch.nn as nn
-from typing import Tuple
+from typing import Tuple, TYPE_CHECKING
 
 
 class ThalamicLoop(nn.Module):
@@ -207,6 +207,68 @@ class Layer6bTransformer(nn.Module):
             z_allo_flat = torch.zeros_like(z_allo_flat)
 
         return z_allo_flat  # (2 × n_grid_modules,) — JAMAIS .mean()
+
+    def transform_batch(
+        self,
+        sdr_batch: torch.Tensor,
+        vel_batch: torch.Tensor,
+        h_tc_batch: torch.Tensor,
+    ) -> "Tuple[torch.Tensor, torch.Tensor]":
+        """
+        Version batché de transform() — traitement de B échantillons en parallèle.
+
+        Contrairement à transform(), l'état thalamique est passé explicitement
+        (h_tc_batch) et retourné mis à jour — aucune mutation de buffer.
+        Cela permet de maintenir B états indépendants (un par épisode en cours).
+
+        Invariant I3.1 respecté : renormalisation par norme cible.
+
+        Args:
+            sdr_batch:   SDRs actifs, shape (B, sdr_dim)
+            vel_batch:   vitesses égocentriques, shape (B, 2)
+            h_tc_batch:  état thalamique courant, shape (B, phase_dim)
+
+        Returns:
+            allo_batch:    vecteur allocentrique, shape (B, phase_dim)
+            new_h_tc_batch: état thalamique mis à jour, shape (B, phase_dim)
+        """
+        B = sdr_batch.shape[0]
+
+        # Encodage SDR → espace de phases ego : (B, phase_dim)
+        z_ego = self.encoder(sdr_batch.float())                          # (B, phase_dim)
+        z_ego_r = z_ego.reshape(B, self.n_grid_modules, 2)              # (B, n_mod, 2)
+
+        # Angles de rotation par module : (B, n_modules)
+        theta = self.velocity_encoder(vel_batch.float())                 # (B, n_modules)
+        cos_t = torch.cos(theta)                                         # (B, n_modules)
+        sin_t = torch.sin(theta)                                         # (B, n_modules)
+
+        # Rotation 2D par module (sans boucle) :
+        # z_allo[b, m, 0] = cos[b,m]·z[b,m,0] − sin[b,m]·z[b,m,1]
+        # z_allo[b, m, 1] = sin[b,m]·z[b,m,0] + cos[b,m]·z[b,m,1]
+        x0 = z_ego_r[:, :, 0]                                           # (B, n_mod)
+        x1 = z_ego_r[:, :, 1]                                           # (B, n_mod)
+        z_allo_0 = cos_t * x0 - sin_t * x1                              # (B, n_mod)
+        z_allo_1 = sin_t * x0 + cos_t * x1                              # (B, n_mod)
+        z_allo = torch.stack([z_allo_0, z_allo_1], dim=-1)              # (B, n_mod, 2)
+        z_allo_flat = z_allo.reshape(B, self.phase_dim)                  # (B, phase_dim)
+
+        # Boucle thalamique batché — aucune mutation de buffer
+        h_new = torch.tanh(
+            self.thalamic_loop.W_tc(z_allo_flat)
+            + self.thalamic_loop.W_ht(h_tc_batch)
+        )                                                                # (B, phase_dim)
+        gain = torch.sigmoid(self.thalamic_loop.g_nrt).unsqueeze(0)    # (1, phase_dim)
+        feedback = gain * h_new                                          # (B, phase_dim)
+
+        z_out = z_allo_flat + 0.1 * feedback                            # (B, phase_dim)
+
+        # Renormalisation par norme cible (invariant I3.1)
+        target_norms = z_ego.norm(dim=-1, keepdim=True).clamp(min=self.norm_eps)  # (B,1)
+        current_norms = z_out.norm(dim=-1, keepdim=True).clamp(min=self.norm_eps) # (B,1)
+        z_out = z_out * (target_norms / current_norms)                   # (B, phase_dim)
+
+        return z_out, h_new
 
     def forward(
         self,
