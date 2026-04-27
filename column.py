@@ -152,6 +152,7 @@ class SingleColumn(nn.Module):
         v_t: torch.Tensor,
         train: bool = True,
         gamma_override: float | None = None,
+        l6_init: torch.Tensor | None = None,
     ) -> dict:
         """
         Exécute un pas de traitement pour cette colonne.
@@ -173,6 +174,9 @@ class SingleColumn(nn.Module):
                             train.py. Si None → schedule temporel pur.
                             Permet de moduler la plasticité par la surprise
                             de prédiction (Rao & Ballard 1999).
+            l6_init:        grid_code initial pour l'inférence itérative
+                            (Protocole B). Si None, utilise prev_grid_code
+                            courant (comportement normal). Shape (4·n_modules,).
 
         Returns:
             dict avec :
@@ -184,6 +188,10 @@ class SingleColumn(nn.Module):
                 grid_code:     code de position, shape (4·n_modules,)
                 surprise:      erreur de prédiction Jaccard ∈ [0,1]
         """
+        # Initialisation explicite de prev_grid_code pour inférence itérative
+        if l6_init is not None:
+            self.prev_grid_code.data.copy_(l6_init.detach())
+
         # ── Étape 0 — Prédiction causale (AVANT encodage de s_t) ─────────
         # W_pred a été mis à jour au pas précédent → prédiction informée
         sdr_predicted = self._make_sdr_predicted()          # {0,1}^n_sdr
@@ -394,6 +402,7 @@ class CorticalColumn(nn.Module):
         v_t: torch.Tensor,
         train: bool = True,
         gamma_override: float | None = None,
+        l6_init: torch.Tensor | list | None = None,
     ) -> dict:
         """
         Exécute un pas complet du pseudo-algorithme pour toutes les colonnes.
@@ -410,6 +419,10 @@ class CorticalColumn(nn.Module):
                             train.py à partir de la surprise du pas précédent.
                             Propagé à chaque SingleColumn.step() → SpatialPooler.
                             None → schedule temporel pur (rétro-compatible).
+            l6_init:        grid_code initial pour l'inférence itérative
+                            (Protocole B évaluation prédictive). Si tenseur
+                            1D, diffusé à toutes les colonnes. Si liste de K
+                            tenseurs, un par colonne. None = comportement normal.
 
         Returns:
             dict avec :
@@ -432,8 +445,20 @@ class CorticalColumn(nn.Module):
         all_surprises = []        # ε_t par colonne (moyenne ensuite)
 
         # ── Étapes 0–4 pour chaque colonne ───────────────────────────────
-        for col in self.columns:
-            result = col.step(s_t, v_t, train=train, gamma_override=gamma_override)
+        for c_idx, col in enumerate(self.columns):
+            # Résolution du l6_init par colonne
+            if l6_init is None:
+                col_l6_init = None
+            elif isinstance(l6_init, list):
+                col_l6_init = l6_init[c_idx] if c_idx < len(l6_init) else None
+            else:
+                col_l6_init = l6_init  # même tenseur diffusé à toutes les colonnes
+
+            result = col.step(
+                s_t, v_t, train=train,
+                gamma_override=gamma_override,
+                l6_init=col_l6_init,
+            )
             all_sdrs.append(result["sdr"])
             all_sdrs_predicted.append(result["sdr_predicted"])
             all_phases.append(result["phase"])
