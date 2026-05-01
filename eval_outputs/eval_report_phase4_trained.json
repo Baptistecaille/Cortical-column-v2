@@ -1,0 +1,20 @@
+{
+  "checkpoint": "eval_outputs/cortical_column_phase4.pt",
+  "n_samples": 200,
+  "unsupervised": {
+    "epsilon": 1.0,
+    "sparsity_violation_rate": 0.0,
+    "var_red": 1.0,
+    "pred_success_rate": 0.02,
+    "pred_mean_overlap": 0.20374999999999993,
+    "pred_precision": 0.20374999999999993,
+    "pred_recall": 0.20374999999999993,
+    "lin_prob": 0.75,
+    "nmi": 0.43056252327566874,
+    "SI": 0.9922555264576071
+  },
+  "benchmark": {
+    "mnist_linear_probe_acc": 0.7450000047683716,
+    "mnist_rotation_invariance": 0.007510635120173295
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "checkpoint": "random_weights",
+  "n_samples": 200,
+  "unsupervised": {
+    "epsilon": 1.0,
+    "sparsity_violation_rate": 0.0,
+    "var_red": 1.0,
+    "pred_success_rate": 0.0,
+    "pred_mean_overlap": 0.014124999999999978,
+    "pred_precision": 0.014124999999999978,
+    "pred_recall": 0.014124999999999978,
+    "lin_prob": 0.7250000238418579,
+    "nmi": 0.4278200760408165,
+    "SI": 0.9919165069991873
+  },
+  "benchmark": {
+    "mnist_linear_probe_acc": 0.6600000262260437,
+    "mnist_rotation_invariance": 0.0
+  }
+}

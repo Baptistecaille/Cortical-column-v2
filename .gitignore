@@ -26,6 +26,10 @@ dist/
 .eggs/
 pip-wheel-metadata/
 
+# PyTorch checkpoints (large binary files)
+*.pt
+*.pth
+
 # Logs / runtime temp files
 *.log
 *.tmp
