@@ -352,6 +352,8 @@ def main() -> None:
     parser.add_argument("--n_minicolumns",   type=int,   default=256)
     parser.add_argument("--k_active",        type=int,   default=40)
     parser.add_argument("--n_grid_modules",  type=int,   default=6)
+    parser.add_argument("--grid_periods",    type=str,   default=None,
+                        help="Périodes λ_k séparées par virgules ex: 3,5,7,11,13,17")
     parser.add_argument("--max_translation", type=float, default=4.0)
     parser.add_argument("--max_rotation",    type=float, default=15.0)
     parser.add_argument("--anchor_conf",     type=float, default=0.8)
@@ -407,7 +409,11 @@ def main() -> None:
         n_minicolumns=args.n_minicolumns,
         k_active=args.k_active,
         n_grid_modules=args.n_grid_modules,
-        grid_periods=[3, 5, 7, 11, 13, 17][:args.n_grid_modules],
+        grid_periods=(
+            [int(p) for p in args.grid_periods.split(",")]
+            if args.grid_periods
+            else [3, 5, 7, 11, 13, 17][:args.n_grid_modules]
+        ),
         consensus_threshold=1.0,
         sp_kwargs={
             "newborn_steps":     newborn_steps,
