@@ -52,7 +52,8 @@ def test_run_eval_produces_json_report():
 def test_run_eval_metrics_in_valid_range():
     with tempfile.TemporaryDirectory() as tmpdir:
         report_path = os.path.join(tmpdir, "report.json")
-        _run_eval([], report_path)
+        result = _run_eval([], report_path)
+        assert result.returncode == 0, result.stderr
         with open(report_path) as f:
             data = json.load(f)
         for k, v in data["unsupervised"].items():
@@ -69,12 +70,9 @@ def test_run_eval_with_checkpoint():
         checkpoint = os.path.join(tmpdir, "model.pt")
         # Quick train to get a checkpoint
         subprocess.run(
-            [sys.executable, "scripts/train.py",
-             "--n_images", "50", "--n_epochs", "1",
-             "--n_columns", "2", "--n_sdr", "256", "--w", "10",
-             "--n_minicolumns", "64", "--k_active", "10",
-             "--n_grid_modules", "3",
-             "--save_path", checkpoint],
+            [sys.executable, "scripts/train.py"]
+            + SMALL_MODEL_ARGS
+            + ["--n_images", "50", "--n_epochs", "1", "--save_path", checkpoint],
             capture_output=True, text=True, cwd=ROOT, timeout=60,
         )
         assert os.path.exists(checkpoint), "Checkpoint not created by train.py"
@@ -84,4 +82,5 @@ def test_run_eval_with_checkpoint():
         assert result.returncode == 0, result.stderr
         with open(report_path) as f:
             data = json.load(f)
+        assert "checkpoint" in data, f"Missing 'checkpoint' key in report; got: {list(data.keys())}"
         assert data["checkpoint"] == checkpoint
