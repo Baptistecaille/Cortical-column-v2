@@ -70,6 +70,7 @@ class GridCellNetwork(nn.Module):
         n_modules: int = 6,
         periods: Optional[List[int]] = None,
         velocity_scale: float = 10.0,
+        use_linoss: bool = False,
     ) -> None:
         super().__init__()
 
@@ -98,9 +99,24 @@ class GridCellNetwork(nn.Module):
         scales = (2 * math.pi / lambda_k)   # (n_modules,)
         self.register_buffer("R_k_scale", scales)
 
+        # ── LinOSS path integration (Rusch & Rus 2024) — optionnel ──────────
+        # Remplace l'intégration Euler R_k * v_t par un ODE stable oscillatoire.
+        # Entrée : vitesse 2D ; sortie : delta_phi (n_modules, 2).
+        # I4.1 préservé par mod 2π appliqué après la sortie LinOSS.
+        self.use_linoss = use_linoss
+        if use_linoss:
+            from extensions.linoss import LinOSSLayer
+            self.linoss = LinOSSLayer(
+                input_dim=2,
+                state_dim=4 * n_modules,
+                output_dim=2 * n_modules,
+                dt=1.0,
+            )
+        else:
+            self.linoss = None
+
     # ── Intégration de chemin (vitesse directe) ───────────────────────────
 
-    @torch.no_grad()
     def integrate(
         self,
         velocity: torch.Tensor,
@@ -109,29 +125,32 @@ class GridCellNetwork(nn.Module):
         """
         Intègre la vitesse 2D pour mettre à jour les phases sur 𝕋².
 
-        Règle : φ_k ← (φ_k + R_k · v_t · dt) mod 2π
+        Mode Euler (use_linoss=False, défaut) :
+            δφ_k = R_k_scale[k] · v_t · dt
 
-        Propriété de retour : si ∑v_t = 0 → ∑Δφ_k = 0 → phases exactes.
-
-        Invariant I4.1 : φ_k ∈ [0, 2π)² après mod 2π.
-
-        Réf. math : §4.2, Éq. 4.3.
+        Mode LinOSS (use_linoss=True, Rusch & Rus 2024 arXiv 2410.03943) :
+            δφ = linoss(v_t).reshape(n_modules, 2), clamped to (-π, π)
+            Invariant I4.1 préservé par mod 2π.
 
         Args:
-            velocity: vecteur vitesse 2D (allocentrique ou egocentrique),
-                      shape (2,). Doit utiliser les mêmes unités que lors
-                      de la génération des épisodes.
-            dt:       pas de temps (typiquement 1.0)
+            velocity: vecteur vitesse 2D, shape (2,)
+            dt:       pas de temps (mode Euler uniquement)
 
         Returns:
             phases: shape (n_modules, 2)
         """
-        # delta_phi[k] = R_k_scale[k] * velocity, pour chaque module k
-        # shape : (n_modules, 2) = (n_modules, 1) * (1, 2)
-        delta_phi = self.R_k_scale.unsqueeze(1) * velocity.float().unsqueeze(0)
-
-        new_phases = (self.phases + dt * delta_phi) % (2 * math.pi)
-        self.phases.data = new_phases
+        if self.use_linoss and self.linoss is not None:
+            delta_phi_flat = self.linoss(velocity.float())
+            delta_phi = delta_phi_flat.view(self.n_modules, 2).clamp(-math.pi, math.pi)
+            new_phases = (self.phases + dt * delta_phi) % (2 * math.pi)
+            self.phases.data = new_phases.detach()
+        else:
+            with torch.no_grad():
+                delta_phi = (
+                    self.R_k_scale.unsqueeze(1) * velocity.float().unsqueeze(0)
+                )
+                new_phases = (self.phases + dt * delta_phi) % (2 * math.pi)
+                self.phases.data = new_phases
         return self.phases   # (n_modules, 2)
 
     # ── Code de position ──────────────────────────────────────────────────
@@ -291,5 +310,6 @@ class GridCellNetwork(nn.Module):
         return (
             f"n_modules={self.n_modules}, periods={self.periods}, "
             f"capacity={self.position_capacity()}, "
-            f"velocity_scale={self.velocity_scale}"
+            f"velocity_scale={self.velocity_scale}, "
+            f"use_linoss={self.use_linoss}"
         )
