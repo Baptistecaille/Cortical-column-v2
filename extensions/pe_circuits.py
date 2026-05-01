@@ -58,6 +58,7 @@ class PECircuits(nn.Module):
         tau_pos: float = 10.0,
         tau_neg: float = 10.0,
         theta_ca: float = 15.0,
+        use_stp: bool = False,
     ) -> None:
         super().__init__()
 
@@ -106,6 +107,22 @@ class PECircuits(nn.Module):
         self.register_buffer("_W_inh_pe_pos", torch.rand(dim, n_pv) * scale_pv)
         self.register_buffer("_W_inh_pe_neg", torch.rand(dim, n_pv) * scale_pv)
         self.register_buffer("_W_som_dend",   torch.rand(dim, n_sv) * scale_sv)
+
+        # ── iSTP — Waitzmann 2024 (optionnel) ────────────────────────────────
+        # STPSynapse en mode STD pour la connexion PV1→PE-.
+        # u = U constant en STD (bug B6 : ne pas faire évoluer u).
+        self.use_stp = use_stp
+        if use_stp:
+            from extensions.stp_synapse import STPSynapse
+            self.pv1_stp = STPSynapse(
+                n_synapses=n_pv,
+                mode="STD",
+                U=0.5,
+                tau_d=200.0,
+                dt=1.0,
+            )
+        else:
+            self.pv1_stp = None
 
     # ── Prédiction et erreurs ─────────────────────────────────────────────
 
@@ -164,9 +181,18 @@ class PECircuits(nn.Module):
         r_som = F.relu(self._W_som_in @ x - self._W_vip_som @ r_vip)
 
         pe_pos = F.relu(x - predicted - self._W_inh_pe_pos @ r_pv2)
+
+        # iSTP (Waitzmann 2024) : modulation de r_pv1 par la dépression STD.
+        # En STD : u = U constant, seul x évolue (bug B6 — ne pas faire évoluer u).
+        # Après épuisement, r_pv1_eff < r_pv1 → moins d'inhibition sur PE-.
+        if self.use_stp and self.pv1_stp is not None:
+            r_pv1_eff = self.pv1_stp.forward(r_pv1)
+        else:
+            r_pv1_eff = r_pv1
+
         pe_neg = F.relu(
             predicted - x
-            - self._W_inh_pe_neg @ r_pv1
+            - self._W_inh_pe_neg @ r_pv1_eff
             - self._W_som_dend  @ r_som
         )
 
@@ -417,6 +443,8 @@ class PECircuits(nn.Module):
         self.r_pv2.data.zero_()
         self.r_som.data.zero_()
         self.r_vip.data.zero_()
+        if self.use_stp and self.pv1_stp is not None:
+            self.pv1_stp.reset()
 
     def pe_magnitude(self) -> dict:
         """Statistiques des signaux PE courants (diagnostic)."""
