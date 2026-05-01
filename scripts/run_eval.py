@@ -60,6 +60,10 @@ def main() -> None:
         if args.grid_periods
         else [3, 5, 7, 11, 13, 17][: args.n_grid_modules]
     )
+    if len(periods) != args.n_grid_modules:
+        parser.error(
+            f"--grid_periods a {len(periods)} éléments mais --n_grid_modules={args.n_grid_modules}"
+        )
 
     model = CorticalColumn(
         n_columns=args.n_columns,
@@ -90,6 +94,9 @@ def main() -> None:
         root=args.data_dir, train=False, download=True, transform=transform
     )
     n = min(args.n_samples, len(ds))
+    if n == 0:
+        print("[ERREUR] Dataset MNIST vide ou --n_samples=0.")
+        sys.exit(1)
     loader = torch.utils.data.DataLoader(
         torch.utils.data.Subset(ds, range(n)),
         batch_size=n,

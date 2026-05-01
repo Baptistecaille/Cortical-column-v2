@@ -401,6 +401,16 @@ def main() -> None:
     total_steps   = args.n_epochs * args.n_images * args.n_views
     tau_decay     = max(1, total_steps - newborn_steps)
 
+    grid_periods_list = (
+        [int(p) for p in args.grid_periods.split(",")]
+        if args.grid_periods
+        else [3, 5, 7, 11, 13, 17][:args.n_grid_modules]
+    )
+    if len(grid_periods_list) != args.n_grid_modules:
+        parser.error(
+            f"--grid_periods a {len(grid_periods_list)} éléments mais --n_grid_modules={args.n_grid_modules}"
+        )
+
     model = CorticalColumn(
         n_columns=args.n_columns,
         input_dim=784,
@@ -409,11 +419,7 @@ def main() -> None:
         n_minicolumns=args.n_minicolumns,
         k_active=args.k_active,
         n_grid_modules=args.n_grid_modules,
-        grid_periods=(
-            [int(p) for p in args.grid_periods.split(",")]
-            if args.grid_periods
-            else [3, 5, 7, 11, 13, 17][:args.n_grid_modules]
-        ),
+        grid_periods=grid_periods_list,
         consensus_threshold=1.0,
         sp_kwargs={
             "newborn_steps":     newborn_steps,
