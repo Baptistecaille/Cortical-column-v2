@@ -100,6 +100,9 @@ class BenchmarkRunner:
         Returns:
             dict avec 'representations' (N, dim), 'labels' (N,)
         """
+        device = next(
+            (p.device for p in self.model.parameters()), torch.device(self.device)
+        )
         self.model.eval()
         self.model.reset()
 
@@ -114,12 +117,12 @@ class BenchmarkRunner:
             # Format : (input, label) ou (input, velocity, label)
             if len(batch) == 2:
                 inputs, labels = batch
-                velocities = torch.zeros(inputs.shape[0], 2, device=self.device)
+                velocities = torch.zeros(inputs.shape[0], 2, device=device)
             else:
                 inputs, velocities, labels = batch
 
-            inputs = inputs.to(self.device)
-            velocities = velocities.to(self.device)
+            inputs = inputs.to(device)
+            velocities = velocities.to(device)
 
             for i in range(inputs.shape[0]):
                 if count >= max_samples:
@@ -359,7 +362,9 @@ class BenchmarkRunner:
             if pair_sims:
                 scores.append(sum(pair_sims) / len(pair_sims))
 
-        return float(sum(scores) / len(scores)) if scores else 0.0
+        raw = float(sum(scores) / len(scores)) if scores else 0.0
+        # Cosine similarity ∈ [-1, 1] ; on ramène à [0, 1] pour cohérence avec la doc
+        return max(0.0, min(1.0, raw))
 
     def print_comparison(
         self,
@@ -405,6 +410,14 @@ class BenchmarkRunner:
         import json
         from pathlib import Path
 
+        class _SafeEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, float) and (
+                    obj != obj or obj == float("inf") or obj == float("-inf")
+                ):
+                    return str(obj)
+                return super().default(obj)
+
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
-            json.dump(results, f, indent=2)
+            json.dump(results, f, indent=2, cls=_SafeEncoder)
