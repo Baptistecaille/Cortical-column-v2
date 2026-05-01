@@ -25,6 +25,7 @@ Le prédicteur lui-même est mis à jour par la règle delta (sans autograd) :
 Réf. : Lee 2025, §2 — Formalisation_Mille_Cerveaux.pdf §6
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -83,6 +84,29 @@ class PECircuits(nn.Module):
         self.register_buffer("r_Ls_pos", torch.zeros(dim))
         self.register_buffer("r_Ls_neg", torch.zeros(dim))
 
+        # ── Populations interneurones (Nemati 2025) — poids FIXES ────────────
+        n_pv = max(1, dim // 4)
+        n_sv = max(1, dim // 8)
+        self.n_pv = n_pv
+        self.n_sv = n_sv
+
+        self.register_buffer("r_pv1", torch.zeros(n_pv))
+        self.register_buffer("r_pv2", torch.zeros(n_pv))
+        self.register_buffer("r_som", torch.zeros(n_sv))
+        self.register_buffer("r_vip", torch.zeros(n_sv))
+
+        scale_pv = 1.0 / math.sqrt(dim)
+        scale_sv = 1.0 / math.sqrt(dim)
+
+        self.register_buffer("_W_pv1_ff",     torch.rand(n_pv, dim) * scale_pv)
+        self.register_buffer("_W_pv2_td",     torch.rand(n_pv, dim) * scale_pv)
+        self.register_buffer("_W_vip_td",     torch.rand(n_sv, dim) * scale_sv)
+        self.register_buffer("_W_som_in",     torch.rand(n_sv, dim) * scale_sv)
+        self.register_buffer("_W_vip_som",    torch.rand(n_sv, n_sv) * (1.0 / math.sqrt(max(1, n_sv))))
+        self.register_buffer("_W_inh_pe_pos", torch.rand(dim, n_pv) * scale_pv)
+        self.register_buffer("_W_inh_pe_neg", torch.rand(dim, n_pv) * scale_pv)
+        self.register_buffer("_W_som_dend",   torch.rand(dim, n_sv) * scale_sv)
+
     # ── Prédiction et erreurs ─────────────────────────────────────────────
 
     @torch.no_grad()
@@ -109,6 +133,49 @@ class PECircuits(nn.Module):
         predicted = self.predictor(context)
         error = x - predicted
         return F.relu(error), F.relu(-error)
+
+    @torch.no_grad()
+    def compute_prediction_errors_with_interneurons(
+        self,
+        x: torch.Tensor,
+        predicted: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Calcule PE+ et PE− avec modulation par le circuit interneurones.
+
+        Circuit (Nemati 2025 bioRxiv 2025.11.01.686040) :
+            PV1 ← feedforward x        → supprime PE- soma
+            PV2 ← top-down predicted   → supprime PE+ soma
+            VIP ← top-down predicted   → supprime SOM (disinhibition)
+            SOM ← x                    → supprime dendrite PE- (équilibre)
+            PE+ = ReLU(x − predicted − W_inh_pe_pos @ r_pv2)
+            PE− = ReLU(predicted − x  − W_inh_pe_neg @ r_pv1 − W_som_dend @ r_som)
+
+        Args:
+            x:         activité L4 (feedforward), shape (dim,)
+            predicted: prédiction top-down,        shape (dim,)
+
+        Returns:
+            (pe_pos, pe_neg): erreurs signées, chacune shape (dim,)
+        """
+        r_pv1 = F.relu(self._W_pv1_ff @ x)
+        r_pv2 = F.relu(self._W_pv2_td @ predicted)
+        r_vip = F.relu(self._W_vip_td @ predicted)
+        r_som = F.relu(self._W_som_in @ x - self._W_vip_som @ r_vip)
+
+        pe_pos = F.relu(x - predicted - self._W_inh_pe_pos @ r_pv2)
+        pe_neg = F.relu(
+            predicted - x
+            - self._W_inh_pe_neg @ r_pv1
+            - self._W_som_dend  @ r_som
+        )
+
+        self.r_pv1.data.copy_(r_pv1)
+        self.r_pv2.data.copy_(r_pv2)
+        self.r_som.data.copy_(r_som)
+        self.r_vip.data.copy_(r_vip)
+
+        return pe_pos, pe_neg
 
     # ── Pas complet : prédiction + mise à jour prédicteur + états PE ─────
 
@@ -145,8 +212,9 @@ class PECircuits(nn.Module):
         predicted = self.predictor(context)        # (dim,)
         error = x - predicted                       # (dim,) — erreur signée
 
-        pe_pos = F.relu(error)                      # surplus  → LTP
-        pe_neg = F.relu(-error)                     # déficit  → LTD
+        pe_pos, pe_neg = self.compute_prediction_errors_with_interneurons(
+            x, predicted
+        )
 
         # Mise à jour du prédicteur — règle delta (sans autograd)
         self.predictor.weight.data.add_(
@@ -251,8 +319,22 @@ class PECircuits(nn.Module):
         """
         predicted = self.predictor(context_batch)            # (B, dim)
         error     = x_batch - predicted                       # (B, dim)
-        pe_pos    = F.relu(error)                             # (B, dim)
-        pe_neg    = F.relu(-error)                            # (B, dim)
+        # Circuit interneurones batché (B épisodes)
+        r_pv1_b = F.relu(x_batch @ self._W_pv1_ff.T)         # (B, n_pv)
+        r_pv2_b = F.relu(predicted @ self._W_pv2_td.T)       # (B, n_pv)
+        r_vip_b = F.relu(predicted @ self._W_vip_td.T)       # (B, n_sv)
+        r_som_b = F.relu(
+            F.relu(x_batch @ self._W_som_in.T)
+            - r_vip_b @ self._W_vip_som.T
+        )                                                     # (B, n_sv)
+        pe_pos = F.relu(
+            x_batch - predicted - r_pv2_b @ self._W_inh_pe_pos.T
+        )                                                     # (B, dim)
+        pe_neg = F.relu(
+            predicted - x_batch
+            - r_pv1_b @ self._W_inh_pe_neg.T
+            - r_som_b @ self._W_som_dend.T
+        )                                                     # (B, dim)
 
         # Mise à jour du prédicteur — règle delta moyennée sur le batch
         # ΔW = lr · (1/B) · erreurᵀ @ contexte  (produit externe moyenné)
@@ -331,6 +413,10 @@ class PECircuits(nn.Module):
         """Réinitialise les états PE+/PE− (nouvel épisode)."""
         self.r_Ls_pos.data.zero_()
         self.r_Ls_neg.data.zero_()
+        self.r_pv1.data.zero_()
+        self.r_pv2.data.zero_()
+        self.r_som.data.zero_()
+        self.r_vip.data.zero_()
 
     def pe_magnitude(self) -> dict:
         """Statistiques des signaux PE courants (diagnostic)."""
@@ -345,6 +431,7 @@ class PECircuits(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"dim={self.dim}, context_dim={self.context_dim}, "
+            f"n_pv={self.n_pv}, n_sv={self.n_sv}, "
             f"tau_pos={self.tau_pos}, tau_neg={self.tau_neg}, "
             f"theta_ca={self.theta_ca}"
         )
