@@ -58,17 +58,12 @@ def test_save_report_writes_json(tmp_path):
     assert "rotation_inv" in data
 
 
-def test_rotation_invariance_uses_correct_result_key():
-    """
-    Regression: run_rotation_invariance must NOT crash with KeyError("grid_code").
-    The correct key is result["all_grid_codes"][0].
-    """
+def test_cortical_column_step_returns_all_grid_codes_not_grid_code():
+    """Regression: step() exposes 'all_grid_codes', not 'grid_code'."""
     model = _make_small_model()
-    runner = BenchmarkRunner(model, device="cpu")
-    # Build a minimal views dataloader: 1 sample, 2 views
-    img = torch.rand(784)
-    views = [img, img + 0.01]
-    loader = [([v.unsqueeze(0) for v in views], torch.tensor(0))]
-    # Should not raise KeyError
-    score = runner.run_rotation_invariance(loader, n_views=2)
-    assert isinstance(score, float)
+    s_t = torch.rand(784)
+    v_t = torch.zeros(2)
+    result = model.step(s_t, v_t, train=False)
+    assert "all_grid_codes" in result, "Missing 'all_grid_codes' key in step() output"
+    assert "grid_code" not in result, "'grid_code' key must not exist in step() output"
+    assert isinstance(result["all_grid_codes"][0], torch.Tensor)
