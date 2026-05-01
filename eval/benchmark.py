@@ -220,7 +220,7 @@ class BenchmarkRunner:
                 result = self.model.step(
                     view.to(self.device), v_t, train=False
                 )
-                view_reprs.append(result["grid_code"].float())
+                view_reprs.append(result["all_grid_codes"][0].float())
 
             if len(view_reprs) < 2:
                 continue
@@ -239,6 +239,125 @@ class BenchmarkRunner:
 
             if pairs > 0:
                 scores.append(total_sim / pairs)
+
+        return float(sum(scores) / len(scores)) if scores else 0.0
+
+    def run_mnist_linear_probe(
+        self,
+        n_train: int = 500,
+        n_test: int = 200,
+        n_epochs: int = 50,
+        data_dir: str = "./data",
+    ) -> float:
+        """
+        Proxy pour ImageNet-1K linear probe — évalue la qualité des représentations
+        sur MNIST test via sonde linéaire standard.
+
+        Args:
+            n_train: nombre d'images d'entraînement pour la sonde linéaire
+            n_test:  nombre d'images de test
+            n_epochs: epochs d'entraînement de la sonde
+            data_dir: répertoire racine des données MNIST
+
+        Returns:
+            top1_accuracy ∈ [0, 1]
+        """
+        import torchvision
+        import torchvision.transforms as T
+
+        transform = T.Compose([T.ToTensor(), T.Lambda(lambda x: x.view(-1))])
+
+        ds_train = torchvision.datasets.MNIST(
+            root=data_dir, train=True, download=True, transform=transform
+        )
+        ds_test = torchvision.datasets.MNIST(
+            root=data_dir, train=False, download=True, transform=transform
+        )
+
+        train_loader = torch.utils.data.DataLoader(
+            torch.utils.data.Subset(ds_train, range(min(n_train, len(ds_train)))),
+            batch_size=64,
+            shuffle=False,
+            num_workers=0,
+        )
+        test_loader = torch.utils.data.DataLoader(
+            torch.utils.data.Subset(ds_test, range(min(n_test, len(ds_test)))),
+            batch_size=64,
+            shuffle=False,
+            num_workers=0,
+        )
+
+        train_data = self.extract_representations(train_loader, max_samples=n_train)
+        test_data = self.extract_representations(test_loader, max_samples=n_test)
+
+        return self.run_linear_probe(
+            train_data["representations"],
+            train_data["labels"],
+            test_data["representations"],
+            test_data["labels"],
+            n_epochs=n_epochs,
+        )
+
+    def run_mnist_rotation_benchmark(
+        self,
+        n_samples: int = 200,
+        n_views: int = 4,
+        data_dir: str = "./data",
+    ) -> float:
+        """
+        Proxy pour CO3Dv2 rotation invariance — mesure la similarité cosinus
+        des grid codes entre rotations d'une même image MNIST.
+
+        Pour chaque image, génère n_views rotations (0°, 90°, 180°, 270°) et
+        mesure la similarité cosinus moyenne entre toutes les paires de vues.
+
+        Args:
+            n_samples: nombre d'images à évaluer
+            n_views:   nombre de rotations par image (max 4 : 0°, 90°, 180°, 270°)
+            data_dir:  répertoire racine des données MNIST
+
+        Returns:
+            rotation_invariance_score ∈ [0, 1] (1 = représentations identiques)
+        """
+        import torchvision
+        import torchvision.transforms as T
+        import torchvision.transforms.functional as TF
+        import torch.nn.functional as F
+
+        transform = T.ToTensor()
+        ds = torchvision.datasets.MNIST(
+            root=data_dir, train=False, download=True, transform=transform
+        )
+
+        angles = [0, 90, 180, 270][:n_views]
+        scores = []
+
+        model_device = next(
+            (p.device for p in self.model.parameters()), torch.device("cpu")
+        )
+
+        for i in range(min(n_samples, len(ds))):
+            img, _ = ds[i]   # (1, 28, 28)
+            view_reprs = []
+
+            for angle in angles:
+                self.model.reset()
+                rotated = TF.rotate(img, angle).view(-1).to(model_device)
+                v_t = torch.zeros(2, device=model_device)
+                result = self.model.step(rotated, v_t, train=False)
+                view_reprs.append(result["all_grid_codes"][0].float())
+
+            pair_sims = []
+            for a in range(len(view_reprs)):
+                for b in range(a + 1, len(view_reprs)):
+                    sim = F.cosine_similarity(
+                        view_reprs[a].unsqueeze(0),
+                        view_reprs[b].unsqueeze(0),
+                    ).item()
+                    pair_sims.append(sim)
+
+            if pair_sims:
+                scores.append(sum(pair_sims) / len(pair_sims))
 
         return float(sum(scores) / len(scores)) if scores else 0.0
 
@@ -274,3 +393,18 @@ class BenchmarkRunner:
             print(row)
 
         print("=" * 60 + "\n")
+
+    def save_report(self, results: Dict[str, Any], path: str) -> None:
+        """
+        Sauvegarde un rapport de benchmark au format JSON.
+
+        Args:
+            results: dict de métriques (valeurs float ou sous-dicts)
+            path:    chemin du fichier JSON de sortie
+        """
+        import json
+        from pathlib import Path
+
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(results, f, indent=2)
