@@ -429,7 +429,8 @@ class CorticalColumn(nn.Module):
         self.enable_vote = enable_vote
         self.alpha_divergence = alpha_divergence
         # État glissant pour cmp_vote_stability (Jaccard consécutif)
-        self._prev_vote_sdr: Optional[torch.Tensor] = None
+        self._prev_vote_sdr: Optional[torch.Tensor] = None         # mode B=1 (n_sdr,)
+        self._prev_vote_sdr_batch: Optional[torch.Tensor] = None   # mode B>1 (B, n_sdr)
 
         # K colonnes INDÉPENDANTES (SDRSpace, permanences SP, L6b, GridCell) — I6.1
         self.columns = nn.ModuleList([
@@ -513,6 +514,57 @@ class CorticalColumn(nn.Module):
         vote_sdr[top_idx] = 1.0
 
         return vote_sdr
+
+    @torch.no_grad()
+    def _cross_column_vote_batch(
+        self,
+        all_sdrs: List[torch.Tensor],       # K × (B, n_sdr)
+        all_grid_codes: List[torch.Tensor], # K × (B, 4·n_modules)
+    ) -> torch.Tensor:
+        """
+        Vote inter-colonnes pondéré par cohérence de pose, version batché.
+
+        Même protocole que _cross_column_vote mais sur B épisodes simultanés :
+            1. Grid code moyen par sample → poids cosinus par colonne et par sample
+            2. Somme pondérée des SDRs → top-w par sample → SDRs binaires
+
+        Args:
+            all_sdrs:        K tenseurs (B, n_sdr)
+            all_grid_codes:  K tenseurs (B, 4·n_modules)
+
+        Returns:
+            vote_sdr_batch: shape (B, n_sdr), ||vote_b||₁ = w pour tout b
+        """
+        K = len(all_sdrs)
+        B = all_sdrs[0].shape[0]
+        device = all_sdrs[0].device
+
+        gc_stack = torch.stack(all_grid_codes, dim=0).float()        # (K, B, D_gc)
+        gc_mean  = gc_stack.mean(dim=0)                              # (B, D_gc)
+        gc_mean_norm = gc_mean / (gc_mean.norm(dim=-1, keepdim=True) + 1e-8)  # (B, D_gc)
+
+        gc_norms      = gc_stack.norm(dim=-1, keepdim=True) + 1e-8  # (K, B, 1)
+        gc_normalized = gc_stack / gc_norms                          # (K, B, D_gc)
+        # (K, B, D_gc) · (1, B, D_gc) → sum → (K, B)
+        cos_weights = (gc_normalized * gc_mean_norm.unsqueeze(0)).sum(dim=-1).clamp(min=0.0)
+
+        # Poids uniformes là où toutes les poses sont orthogonales
+        cos_sum = cos_weights.sum(dim=0, keepdim=True)               # (1, B)
+        cos_weights = torch.where(
+            cos_sum < 1e-8,
+            torch.ones_like(cos_weights) / K,
+            cos_weights / cos_sum,
+        )                                                             # (K, B)
+
+        sdr_stack   = torch.stack(all_sdrs, dim=0).float()          # (K, B, n_sdr)
+        vote_scores = (cos_weights.unsqueeze(-1) * sdr_stack).sum(dim=0)  # (B, n_sdr)
+
+        # Top-w strict par sample → SDR binaire (invariant I1.1 par sample)
+        _, top_idx = torch.topk(vote_scores, self.w, dim=-1)         # (B, w)
+        vote_sdr_batch = torch.zeros(B, self.n_sdr, device=device)
+        vote_sdr_batch.scatter_(-1, top_idx, 1.0)
+
+        return vote_sdr_batch
 
     def step(
         self,
@@ -785,6 +837,36 @@ class CorticalColumn(nn.Module):
         # ── Surprise moyenne K colonnes ───────────────────────────────────
         mean_surprise = torch.stack(all_surprises, dim=0).mean(dim=0)     # (B,)
 
+        # ── Métriques CMP proximales (version batché) ─────────────────────
+        cmp_jac_b = float("nan")
+        cmp_prs_b = float("nan")
+        cmp_sta_b = float("nan")
+        if self.n_columns > 1:
+            vote_sdr_batch = self._cross_column_vote_batch(all_sdrs, all_grid_codes)
+
+            jac_vals_b, prs_vals_b = [], []
+            for sdr_k in all_sdrs:                           # (B, n_sdr)
+                s = sdr_k.float()
+                v = vote_sdr_batch
+                inter = (s * v).sum(dim=-1)                                   # (B,)
+                union = ((s + v) > 0).float().sum(dim=-1).clamp(min=1.0)     # (B,)
+                jac_vals_b.append(float((inter / union).mean().item()))
+                n_active = s.sum(dim=-1).clamp(min=1.0)
+                prs_vals_b.append(float((1.0 - inter / n_active).mean().item()))
+            cmp_jac_b = sum(jac_vals_b) / len(jac_vals_b)
+            cmp_prs_b = sum(prs_vals_b) / len(prs_vals_b)
+
+            # Stabilité : Jaccard(vote_t, vote_{t-1}) moyenné sur B
+            if (self._prev_vote_sdr_batch is not None
+                    and self._prev_vote_sdr_batch.shape == vote_sdr_batch.shape):
+                v_curr = vote_sdr_batch.float()
+                v_prev = self._prev_vote_sdr_batch.float()
+                inter_v = (v_curr * v_prev).sum(dim=-1)
+                union_v = ((v_curr + v_prev) > 0).float().sum(dim=-1).clamp(min=1.0)
+                cmp_sta_b = float((inter_v / union_v).mean().item())
+
+            self._prev_vote_sdr_batch = vote_sdr_batch.clone()
+
         results = {
             "sdr":              all_sdrs[0],
             "sdr_predicted":    all_sdrs_predicted[0],
@@ -795,6 +877,10 @@ class CorticalColumn(nn.Module):
             "all_grid_codes":   all_grid_codes,
             "all_phases":       all_phases,
             "surprise":         mean_surprise,
+            # Diagnostics CMP — mêmes clés que step() pour uniformité
+            "cmp_jaccard_active_vs_vote": cmp_jac_b,
+            "cmp_pressure":              cmp_prs_b,
+            "cmp_vote_stability":        cmp_sta_b,
         }
         return results, new_states
 
@@ -913,6 +999,7 @@ class CorticalColumn(nn.Module):
         comportement correct car le modèle ne sait pas encore où il se trouve.
         """
         self._prev_vote_sdr = None
+        self._prev_vote_sdr_batch = None
         for col in self.columns:
             col.grid_cell.reset()
             col.layer6b.reset_thalamic_state()

@@ -238,8 +238,7 @@ def train(
             sdrs_episode:           List[torch.Tensor] = []
             sdrs_predicted_episode: List[torch.Tensor] = []
             surprises_episode:      List[float]        = []
-            # Métriques CMP par vue — collectées uniquement en mode B=1
-            # (step_parallel ne calcule pas ces diagnostics)
+            # Métriques CMP par vue — collectées dans les deux modes (B=1 et B>1)
             cmp_jaccard_episode:   List[float] = []
             cmp_pressure_episode:  List[float] = []
             cmp_stability_episode: List[float] = []
@@ -283,6 +282,16 @@ def train(
                         views_batch[:, v, :], vel_batch[:, v, :],
                         state_batch, train=True, gamma_override=gamma_eff,
                     )
+                    # Collecte des diagnostics CMP depuis step_parallel
+                    jac = results.get("cmp_jaccard_active_vs_vote", float("nan"))
+                    prs = results.get("cmp_pressure", float("nan"))
+                    sta = results.get("cmp_vote_stability", float("nan"))
+                    if not math.isnan(jac):
+                        cmp_jaccard_episode.append(jac)
+                    if not math.isnan(prs):
+                        cmp_pressure_episode.append(prs)
+                    if not math.isnan(sta):
+                        cmp_stability_episode.append(sta)
 
                 last_all_sdrs = results["all_sdrs"]   # mis à jour à chaque vue
 
