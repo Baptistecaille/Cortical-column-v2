@@ -227,11 +227,16 @@ def train(
 
             # ── Initialisation des états (B épisodes) ──────────────────────
             state_batch = model.make_batch_state(B, dev)
-            # Réinitialise l'état glissant du vote pour éviter la contamination
-            # inter-épisodes sur cmp_vote_stability (sinon la première vue d'un
-            # nouvel épisode mesure Jaccard contre le vote du dernier épisode).
-            model._prev_vote_sdr       = None
-            model._prev_vote_sdr_batch = None
+            if B == 1:
+                # En mode scalaire, step() utilise l'état interne persistant
+                # (grid_cell, layer6b, pe_circuits, prev_grid_code).
+                # model.reset() est obligatoire pour que chaque image parte
+                # d'un état propre ; il couvre aussi _prev_vote_sdr.
+                model.reset()
+            else:
+                # En mode batché, step_parallel() lit l'état externe (state_batch).
+                # Seul _prev_vote_sdr_batch vit sur le modèle → reset ciblé.
+                model._prev_vote_sdr_batch = None
             # Mémoriser les phases initiales pour l'ancrage de retour
             initial_phases = [state_batch[c]["phases"].clone() for c in range(model.n_columns)]
 
