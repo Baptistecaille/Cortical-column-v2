@@ -462,6 +462,11 @@ class UnsupervisedEvaluator:
         consensus_n_active_list: List[int] = []
         pairwise_overlap_list: List[float] = []
 
+        # Diagnostics CMP proximaux (A/B test enable_vote)
+        cmp_jaccard_list:   List[float] = []
+        cmp_pressure_list:  List[float] = []
+        cmp_stability_list: List[float] = []
+
         self.model.reset()
 
         for t in range(N):
@@ -500,6 +505,17 @@ class UnsupervisedEvaluator:
             # consensus diagnostics — nombre de bits actifs au pas t
             consensus_n_active_list.append(int(consensus.sum().item()))
 
+            # Diagnostics CMP — disponibles quelle que soit enable_vote
+            jac = result.get("cmp_jaccard_active_vs_vote", float("nan"))
+            prs = result.get("cmp_pressure", float("nan"))
+            sta = result.get("cmp_vote_stability", float("nan"))
+            if not math.isnan(jac):
+                cmp_jaccard_list.append(jac)
+            if not math.isnan(prs):
+                cmp_pressure_list.append(prs)
+            if not math.isnan(sta):
+                cmp_stability_list.append(sta)
+
             # overlap pairwise (Jaccard) entre toutes les paires de SDRs de colonnes
             sdrs_t = result["all_sdrs"]
             K_t = len(sdrs_t)
@@ -515,6 +531,9 @@ class UnsupervisedEvaluator:
                 sum(pair_overlaps_t) / len(pair_overlaps_t) if pair_overlaps_t else 0.0
             )
 
+        def _mean_or_nan(lst: List[float]) -> float:
+            return float(sum(lst) / len(lst)) if lst else float("nan")
+
         metrics = {
             "epsilon": float(sum(reconstruction_errors) / N),
             "sparsity_violation_rate": float(sparsity_violations / N),
@@ -524,6 +543,10 @@ class UnsupervisedEvaluator:
                 sum(1 for v in consensus_n_active_list if v == 0) / N
             ),
             "mean_pairwise_column_overlap": float(sum(pairwise_overlap_list) / N),
+            # Diagnostics CMP proximaux
+            "cmp_jaccard_active_vs_vote": _mean_or_nan(cmp_jaccard_list),
+            "cmp_pressure":               _mean_or_nan(cmp_pressure_list),
+            "cmp_vote_stability":          _mean_or_nan(cmp_stability_list),
         }
 
         # pred_success — taux de succès des prédictions (predictive coding)
