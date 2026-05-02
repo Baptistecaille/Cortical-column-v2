@@ -181,13 +181,20 @@ def train(
         "step": [], "cross_view_overlap": [], "pred_success_rate": [],
         "gamma": [], "gamma_surprise_ema": [], "surprise": [], "p_conn": [],
         "mean_pairwise_column_overlap": [],
+        # Diagnostics CMP proximaux (A/B test enable_vote)
+        "cmp_jaccard_active_vs_vote": [],
+        "cmp_pressure": [],
+        "cmp_vote_stability": [],
     }
 
-    _overlap_window:   List[float] = []
-    _pred_window:      List[float] = []
-    _surprise_window:  List[float] = []
-    _pairwise_window:  List[float] = []
-    last_all_sdrs:     List[torch.Tensor] = []
+    _overlap_window:       List[float] = []
+    _pred_window:          List[float] = []
+    _surprise_window:      List[float] = []
+    _pairwise_window:      List[float] = []
+    _cmp_jaccard_window:   List[float] = []
+    _cmp_pressure_window:  List[float] = []
+    _cmp_stability_window: List[float] = []
+    last_all_sdrs:         List[torch.Tensor] = []
     images_processed = 0
     t0 = time.perf_counter()
     prev_surprise: float = 1.0
@@ -226,6 +233,11 @@ def train(
             sdrs_episode:           List[torch.Tensor] = []
             sdrs_predicted_episode: List[torch.Tensor] = []
             surprises_episode:      List[float]        = []
+            # Métriques CMP par vue — collectées uniquement en mode B=1
+            # (step_parallel ne calcule pas ces diagnostics)
+            cmp_jaccard_episode:   List[float] = []
+            cmp_pressure_episode:  List[float] = []
+            cmp_stability_episode: List[float] = []
 
             # ── Boucle sur les vues ─────────────────────────────────────────
             for v in range(n_views):
@@ -250,6 +262,16 @@ def train(
                         "surprise":      torch.tensor([model_result["surprise"]], device=dev),
                         "all_sdrs":      model_result["all_sdrs"],   # liste K × (n_sdr,)
                     }
+                    # Collecte des diagnostics CMP (disponibles uniquement via step())
+                    jac = model_result.get("cmp_jaccard_active_vs_vote", float("nan"))
+                    prs = model_result.get("cmp_pressure", float("nan"))
+                    sta = model_result.get("cmp_vote_stability", float("nan"))
+                    if not math.isnan(jac):
+                        cmp_jaccard_episode.append(jac)
+                    if not math.isnan(prs):
+                        cmp_pressure_episode.append(prs)
+                    if not math.isnan(sta):
+                        cmp_stability_episode.append(sta)
                     # Mettre à jour l'état (déjà géré en interne par step())
                 else:
                     results, state_batch = model.step_parallel(
@@ -340,6 +362,40 @@ def train(
                 if len(_pairwise_window) > 100: _pairwise_window.pop(0)
                 col_overlap_smooth = sum(_pairwise_window) / len(_pairwise_window)
 
+                # ── Métriques CMP proximales ──────────────────────────────
+                # Agrégation de l'épisode courant dans les fenêtres glissantes
+                if cmp_jaccard_episode:
+                    _cmp_jaccard_window.append(
+                        sum(cmp_jaccard_episode) / len(cmp_jaccard_episode)
+                    )
+                    if len(_cmp_jaccard_window) > 50:
+                        _cmp_jaccard_window.pop(0)
+                if cmp_pressure_episode:
+                    _cmp_pressure_window.append(
+                        sum(cmp_pressure_episode) / len(cmp_pressure_episode)
+                    )
+                    if len(_cmp_pressure_window) > 50:
+                        _cmp_pressure_window.pop(0)
+                if cmp_stability_episode:
+                    _cmp_stability_window.append(
+                        sum(cmp_stability_episode) / len(cmp_stability_episode)
+                    )
+                    if len(_cmp_stability_window) > 50:
+                        _cmp_stability_window.pop(0)
+
+                cmp_jac_smooth = (
+                    sum(_cmp_jaccard_window) / len(_cmp_jaccard_window)
+                    if _cmp_jaccard_window else float("nan")
+                )
+                cmp_prs_smooth = (
+                    sum(_cmp_pressure_window) / len(_cmp_pressure_window)
+                    if _cmp_pressure_window else float("nan")
+                )
+                cmp_sta_smooth = (
+                    sum(_cmp_stability_window) / len(_cmp_stability_window)
+                    if _cmp_stability_window else float("nan")
+                )
+
                 history["step"].append(images_processed)
                 history["cross_view_overlap"].append(overlap_smooth)
                 history["pred_success_rate"].append(pred_smooth)
@@ -348,7 +404,16 @@ def train(
                 history["surprise"].append(surprise_smooth)
                 history["p_conn"].append(p_stats["frac_connected"])
                 history["mean_pairwise_column_overlap"].append(col_overlap_smooth)
+                history["cmp_jaccard_active_vs_vote"].append(cmp_jac_smooth)
+                history["cmp_pressure"].append(cmp_prs_smooth)
+                history["cmp_vote_stability"].append(cmp_sta_smooth)
 
+                cmp_log = (
+                    f" | jac={cmp_jac_smooth:.3f}"
+                    f" | prs={cmp_prs_smooth:.3f}"
+                    f" | stab={cmp_sta_smooth:.3f}"
+                    if not math.isnan(cmp_jac_smooth) else ""
+                )
                 logger.info(
                     f"Epoch {epoch+1} | {images_processed:6d}/{N*n_epochs} | "
                     f"{ips:5.0f} img/s | B={B} | "
@@ -358,6 +423,7 @@ def train(
                     f"overlap={overlap_smooth:.3f} | "
                     f"col_overlap={col_overlap_smooth:.4f} | "
                     f"pred={pred_smooth*100:.1f}%"
+                    f"{cmp_log}"
                 )
 
     logger.info("Entraînement terminé.")
