@@ -130,7 +130,7 @@ def main() -> None:
     )
     print(f"  [proxy ImageNet-1K] Linear probe accuracy : {lin_probe_acc:.4f}")
 
-    rot_inv_score = runner.run_mnist_rotation_benchmark(
+    rot_inv_score = runner.run_multiview_rotation_benchmark(
         n_samples=args.n_rot_samples,
         data_dir=args.data_dir,
     )

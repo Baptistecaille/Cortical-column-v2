@@ -428,6 +428,8 @@ class CorticalColumn(nn.Module):
         self.w = w
         self.enable_vote = enable_vote
         self.alpha_divergence = alpha_divergence
+        # État glissant pour cmp_vote_stability (Jaccard consécutif)
+        self._prev_vote_sdr: Optional[torch.Tensor] = None
 
         # K colonnes INDÉPENDANTES (SDRSpace, permanences SP, L6b, GridCell) — I6.1
         self.columns = nn.ModuleList([
@@ -585,22 +587,61 @@ class CorticalColumn(nn.Module):
             all_surprises.append(result["surprise"])
 
         # ── Vote inter-colonnes (Phase 2 CMP) ────────────────────────────
+        # Calcul systématique pour disposer d'une baseline passive même
+        # quand enable_vote=False — sans cela, l'A/B test n'est pas interprétable.
         vote_sdr = None
-        if train and self.enable_vote and self.n_columns > 1:
+        if self.n_columns > 1:
             vote_sdr = self._cross_column_vote(all_sdrs, all_grid_codes)
-            # Mise à jour hebbienne ciblée : remplace l'update standard déjà
-            # effectué dans col.step() — on re-applique avec la cible de vote.
-            # Note : col.step(train=True) a déjà incrémenté t_step via
-            # hebbian_update(). On applique l'update ciblé en PLUS, avec
-            # un learning rate réduit (delta implicitement plus petit via
-            # alpha_divergence uniquement sur les bits divergents).
-            for c, col in enumerate(self.columns):
-                col.spatial_pooler.hebbian_update_targeted(
-                    x=all_sdrs[c],
-                    active=all_actives[c],
-                    vote_sdr=vote_sdr,
-                    alpha_divergence=self.alpha_divergence,
+            if train and self.enable_vote:
+                # Mise à jour hebbienne ciblée : col.step(train=True) a déjà
+                # incrémenté t_step. On applique l'update ciblé en PLUS, avec
+                # pression de dépression uniquement sur les bits divergents
+                # (alpha_divergence, §2 CMP Clay-Leadholm 2024).
+                for c, col in enumerate(self.columns):
+                    col.spatial_pooler.hebbian_update_targeted(
+                        x=all_sdrs[c],
+                        active=all_actives[c],
+                        vote_sdr=vote_sdr,
+                        alpha_divergence=self.alpha_divergence,
+                    )
+
+        # ── Métriques CMP proximales (diagnostics A/B test enable_vote) ──
+        # Calculées dans les deux conditions (enable_vote=True/False).
+        cmp_jaccard_list: List[float] = []
+        cmp_pressure_list: List[float] = []
+        if vote_sdr is not None:
+            for sdr_c in all_sdrs:
+                s = sdr_c.float()
+                v = vote_sdr.float()
+                inter = (s * v).sum().item()
+                union = ((s + v) > 0).float().sum().item()
+                # cmp_jaccard_active_vs_vote : Jaccard(sdr_c, vote_sdr)
+                cmp_jaccard_list.append(inter / union if union > 0 else 0.0)
+                # cmp_pressure : fraction de bits actifs déprimés à α·δ⁻
+                n_active = s.sum().item()
+                cmp_pressure_list.append(
+                    1.0 - inter / n_active if n_active > 0 else 0.0
                 )
+
+        cmp_jaccard = (
+            sum(cmp_jaccard_list) / len(cmp_jaccard_list) if cmp_jaccard_list else float("nan")
+        )
+        cmp_pressure = (
+            sum(cmp_pressure_list) / len(cmp_pressure_list) if cmp_pressure_list else float("nan")
+        )
+
+        # cmp_vote_stability : Jaccard(vote_sdr_t, vote_sdr_{t-1})
+        if vote_sdr is not None and self._prev_vote_sdr is not None:
+            v_curr = vote_sdr.float()
+            v_prev = self._prev_vote_sdr.float()
+            inter_v = (v_curr * v_prev).sum().item()
+            union_v = ((v_curr + v_prev) > 0).float().sum().item()
+            cmp_vote_stability = inter_v / union_v if union_v > 0 else 0.0
+        else:
+            cmp_vote_stability = float("nan")
+
+        # Mise à jour du vote précédent (détaché du graphe, pas de gradient)
+        self._prev_vote_sdr = vote_sdr.clone() if vote_sdr is not None else None
 
         # ── Module 5 — Algèbre de déplacement ────────────────────────────
         # Déplacement courant = phase après intégration vs phase précédente.
@@ -638,9 +679,13 @@ class CorticalColumn(nn.Module):
             "all_sdrs_predicted": all_sdrs_predicted,
             "all_phases":       all_phases,
             "all_grid_codes":   all_grid_codes,
-            "vote_stats":       vote_stats,
-            "vote_sdr":         vote_sdr,       # None si enable_vote=False
-            "surprise":         mean_surprise,  # ε_t moyen ∈ [0,1]
+            "vote_stats":              vote_stats,
+            "vote_sdr":                vote_sdr,            # None si n_columns==1
+            "surprise":                mean_surprise,        # ε_t moyen ∈ [0,1]
+            # Diagnostics CMP proximaux — présents quelle que soit enable_vote
+            "cmp_jaccard_active_vs_vote": cmp_jaccard,      # Jaccard(sdr_c, vote_sdr) ↑ si CMP converge
+            "cmp_pressure":            cmp_pressure,         # bits déprimés / w ↓ si CMP converge
+            "cmp_vote_stability":      cmp_vote_stability,   # Jaccard(vote_t, vote_{t-1}) ↑ si attracteur stable
         }
 
     def make_batch_state(self, B: int, device: torch.device) -> List[dict]:
@@ -867,6 +912,7 @@ class CorticalColumn(nn.Module):
         la première prédiction est nulle (prior uniforme sur la position) —
         comportement correct car le modèle ne sait pas encore où il se trouve.
         """
+        self._prev_vote_sdr = None
         for col in self.columns:
             col.grid_cell.reset()
             col.layer6b.reset_thalamic_state()

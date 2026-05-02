@@ -301,26 +301,127 @@ class BenchmarkRunner:
             n_epochs=n_epochs,
         )
 
-    def run_mnist_rotation_benchmark(
+    def run_multiview_rotation_benchmark(
+        self,
+        n_samples: int = 200,
+        n_views: int = 4,
+        data_dir: str = "./data",
+        velocity_scale: float = 0.1,
+    ) -> float:
+        """
+        Proxy CO3Dv2 — protocole séquentiel d'invariance à la rotation.
+
+        Pour chaque image, le modèle traite les n_views rotations en séquence
+        (un seul reset() avant la première vue), avec un déplacement angulaire
+        approximé entre vues consécutives. La représentation allo collectée
+        est la concaténation SDR + grid_code (après L6b).
+
+        Protocole :
+          1. reset() une seule fois par objet.
+          2. n_views rotations : 0°, 90°, 180°, 270°.
+          3. v_t = [cos(Δθ)−1, sin(Δθ)] * velocity_scale (§4, intégration 𝕋²).
+          4. step() sans reset entre les vues.
+          5. repr_allo = cat([sdr.float(), grid_code.float()]).
+          6. Score = mean(cosine_similarity(repr_i, repr_j)) sur toutes les paires.
+
+        Réf. math : §4 (GridCellNetwork, intégration de chemin), §9.1.
+
+        Args:
+            n_samples:      nombre d'images à évaluer
+            n_views:        nombre de rotations par image (max 4)
+            data_dir:       répertoire racine des données MNIST
+            velocity_scale: facteur d'échelle de la vitesse angulaire (défaut 0.1)
+
+        Returns:
+            rotation_invariance_score ∈ [0, 1]
+        """
+        import math as _math
+        import torchvision
+        import torchvision.transforms as T
+        import torchvision.transforms.functional as TF
+        import torch.nn.functional as F
+
+        transform = T.ToTensor()
+        ds = torchvision.datasets.MNIST(
+            root=data_dir, train=False, download=True, transform=transform
+        )
+
+        angles = [0, 90, 180, 270][:n_views]
+        scores = []
+
+        model_device = next(
+            (p.device for p in self.model.parameters()), torch.device("cpu")
+        )
+
+        self.model.eval()
+
+        for i in range(min(n_samples, len(ds))):
+            img, _ = ds[i]  # (1, 28, 28)
+
+            # reset() UNE SEULE FOIS avant les vues d'un même objet
+            self.model.reset()
+
+            view_reprs = []
+            prev_angle = None
+            for angle in angles:
+                delta_angle = 0 if prev_angle is None else angle - prev_angle
+                angle_rad = delta_angle * _math.pi / 180.0
+                v_t = torch.tensor(
+                    [_math.cos(angle_rad) - 1.0, _math.sin(angle_rad)],
+                    dtype=torch.float32,
+                    device=model_device,
+                ) * velocity_scale
+
+                rotated = TF.rotate(img, angle).view(-1).to(model_device)
+                result = self.model.step(rotated, v_t, train=False)
+
+                # repr allo = SDR + grid_code (§3, transformation ego→allo)
+                repr_allo = torch.cat([
+                    result["sdr"].float(),
+                    result["all_grid_codes"][0].float(),
+                ])
+                view_reprs.append(repr_allo)
+                prev_angle = angle
+
+            pair_sims = []
+            for a in range(len(view_reprs)):
+                for b in range(a + 1, len(view_reprs)):
+                    sim = F.cosine_similarity(
+                        view_reprs[a].unsqueeze(0),
+                        view_reprs[b].unsqueeze(0),
+                    ).item()
+                    pair_sims.append(sim)
+
+            if pair_sims:
+                scores.append(sum(pair_sims) / len(pair_sims))
+
+        raw = float(sum(scores) / len(scores)) if scores else 0.0
+        return max(0.0, min(1.0, raw))
+
+    def run_mnist_rotation_benchmark_v1(
         self,
         n_samples: int = 200,
         n_views: int = 4,
         data_dir: str = "./data",
     ) -> float:
         """
-        Proxy pour CO3Dv2 rotation invariance — mesure la similarité cosinus
-        des grid codes entre rotations d'une même image MNIST.
+        DEPRECATED — contrôle négatif seulement, ne pas interpréter
+        comme mesure d'invariance.
 
-        Pour chaque image, génère n_views rotations (0°, 90°, 180°, 270°) et
-        mesure la similarité cosinus moyenne entre toutes les paires de vues.
+        Défauts scientifiques :
+          - reset() entre chaque vue → phases φ réinitialisées aléatoirement
+          - v_t = zeros → les GridCells n'intègrent rien
+          - comparaison de grid_codes bruts aléatoires, pas de représentation allo
+
+        Utiliser run_multiview_rotation_benchmark() à la place.
 
         Args:
             n_samples: nombre d'images à évaluer
-            n_views:   nombre de rotations par image (max 4 : 0°, 90°, 180°, 270°)
+            n_views:   nombre de rotations par image (max 4)
             data_dir:  répertoire racine des données MNIST
 
         Returns:
-            rotation_invariance_score ∈ [0, 1] (1 = représentations identiques)
+            score ∈ [0, 1] (valeur de référence nulle, sans signification)
         """
         import torchvision
         import torchvision.transforms as T
@@ -363,7 +464,6 @@ class BenchmarkRunner:
                 scores.append(sum(pair_sims) / len(pair_sims))
 
         raw = float(sum(scores) / len(scores)) if scores else 0.0
-        # Cosine similarity ∈ [-1, 1] ; on ramène à [0, 1] pour cohérence avec la doc
         return max(0.0, min(1.0, raw))
 
     def print_comparison(

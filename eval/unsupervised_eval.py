@@ -243,9 +243,17 @@ def prediction_success_rate(
             success:  True si overlap >= threshold
             precision: |pred ∩ obs| / |pred| (évite les fausses alarmes)
             recall:    |pred ∩ obs| / |obs|  (= overlap si |pred|=|obs|=w)
+            chance_level: E[overlap] sous prédiction aléatoire = |pred| / n
+            overlap_lift: overlap / chance_level
+            bits_correct: |pred ∩ obs|
     """
     w_obs = sdr_observed.sum().item()
     w_pred = sdr_predicted.sum().item()
+    n_sdr = sdr_observed.numel()
+
+    # overlap = |pred ∩ obs| / |obs|. Sous prédiction aléatoire, chaque bit
+    # observé a une probabilité |pred| / n d'être couvert par le SDR prédit.
+    chance_level = float(w_pred / n_sdr) if n_sdr > 0 else 40.0 / 2048.0
 
     if w_obs == 0 or w_pred == 0:
         return {
@@ -253,18 +261,25 @@ def prediction_success_rate(
             "success": False,
             "precision": 0.0,
             "recall": 0.0,
+            "chance_level": chance_level,
+            "overlap_lift": 0.0,
+            "bits_correct": 0,
         }
 
     intersection = (sdr_predicted * sdr_observed).sum().item()
     overlap = intersection / w_obs
     precision = intersection / w_pred
     recall = intersection / w_obs
+    overlap_lift = overlap / max(chance_level, 1e-8)
 
     return {
         "overlap": float(overlap),
         "success": overlap >= threshold,
         "precision": float(precision),
         "recall": float(recall),
+        "chance_level": chance_level,
+        "overlap_lift": float(overlap_lift),
+        "bits_correct": int(intersection),
     }
 
 
@@ -290,6 +305,9 @@ def batch_prediction_success_rate(
             mean_overlap      : overlap moyen sur tous les pas
             mean_precision    : précision moyenne
             mean_recall       : rappel moyen
+            mean_overlap_lift : lift moyen vs niveau de chance
+            mean_bits_correct : nombre moyen de bits correctement prédits
+            success_rate_at_* : taux de pas dépassant 5%, 10%, 20% d'overlap
     """
     assert len(sdrs_predicted) == len(sdrs_observed), (
         "sdrs_predicted et sdrs_observed doivent avoir la même longueur"
@@ -302,10 +320,15 @@ def batch_prediction_success_rate(
 
     n = len(results)
     return {
-        "pred_success_rate": float(sum(r["success"] for r in results) / n),
-        "mean_overlap":      float(sum(r["overlap"] for r in results) / n),
-        "mean_precision":    float(sum(r["precision"] for r in results) / n),
-        "mean_recall":       float(sum(r["recall"] for r in results) / n),
+        "pred_success_rate":      float(sum(r["success"] for r in results) / n),
+        "mean_overlap":           float(sum(r["overlap"] for r in results) / n),
+        "mean_precision":         float(sum(r["precision"] for r in results) / n),
+        "mean_recall":            float(sum(r["recall"] for r in results) / n),
+        "mean_overlap_lift":      float(sum(r["overlap_lift"] for r in results) / n),
+        "mean_bits_correct":      float(sum(r["bits_correct"] for r in results) / n),
+        "success_rate_at_5pct":   float(sum(r["overlap"] >= 0.05 for r in results) / n),
+        "success_rate_at_10pct":  float(sum(r["overlap"] >= 0.10 for r in results) / n),
+        "success_rate_at_20pct":  float(sum(r["overlap"] >= 0.20 for r in results) / n),
     }
 
 
@@ -435,6 +458,10 @@ class UnsupervisedEvaluator:
         sdrs_predicted_seq: List[torch.Tensor] = []
         sdrs_observed_seq: List[torch.Tensor] = []
 
+        # Diagnostics consensus
+        consensus_n_active_list: List[int] = []
+        pairwise_overlap_list: List[float] = []
+
         self.model.reset()
 
         for t in range(N):
@@ -470,10 +497,33 @@ class UnsupervisedEvaluator:
             for c, col_sdr in enumerate(result["all_sdrs"]):
                 per_column_sdrs[c].append(col_sdr)
 
+            # consensus diagnostics — nombre de bits actifs au pas t
+            consensus_n_active_list.append(int(consensus.sum().item()))
+
+            # overlap pairwise (Jaccard) entre toutes les paires de SDRs de colonnes
+            sdrs_t = result["all_sdrs"]
+            K_t = len(sdrs_t)
+            pair_overlaps_t = []
+            for ci in range(K_t):
+                for cj in range(ci + 1, K_t):
+                    a = sdrs_t[ci].float()
+                    b = sdrs_t[cj].float()
+                    inter = (a * b).sum().item()
+                    union = ((a + b) > 0).float().sum().item()
+                    pair_overlaps_t.append(inter / union if union > 0 else 0.0)
+            pairwise_overlap_list.append(
+                sum(pair_overlaps_t) / len(pair_overlaps_t) if pair_overlaps_t else 0.0
+            )
+
         metrics = {
             "epsilon": float(sum(reconstruction_errors) / N),
             "sparsity_violation_rate": float(sparsity_violations / N),
             "var_red": float(sum(variance_reductions) / N),
+            "consensus_mean_active": float(sum(consensus_n_active_list) / N),
+            "consensus_empty_rate": float(
+                sum(1 for v in consensus_n_active_list if v == 0) / N
+            ),
+            "mean_pairwise_column_overlap": float(sum(pairwise_overlap_list) / N),
         }
 
         # pred_success — taux de succès des prédictions (predictive coding)
@@ -493,16 +543,26 @@ class UnsupervisedEvaluator:
             )
         else:
             pred_stats = {
-                "pred_success_rate": float("nan"),
-                "mean_overlap": float("nan"),
-                "mean_precision": float("nan"),
-                "mean_recall": float("nan"),
+                "pred_success_rate":    float("nan"),
+                "mean_overlap":         float("nan"),
+                "mean_precision":       float("nan"),
+                "mean_recall":          float("nan"),
+                "mean_overlap_lift":    float("nan"),
+                "mean_bits_correct":    float("nan"),
+                "success_rate_at_5pct": float("nan"),
+                "success_rate_at_10pct": float("nan"),
+                "success_rate_at_20pct": float("nan"),
             }
 
         metrics["pred_success_rate"] = pred_stats["pred_success_rate"]
         metrics["pred_mean_overlap"] = pred_stats["mean_overlap"]
         metrics["pred_precision"] = pred_stats["mean_precision"]
         metrics["pred_recall"] = pred_stats["mean_recall"]
+        metrics["mean_overlap_lift"] = pred_stats.get("mean_overlap_lift", float("nan"))
+        metrics["mean_bits_correct"] = pred_stats.get("mean_bits_correct", float("nan"))
+        metrics["pred_success_rate_at_5pct"] = pred_stats.get("success_rate_at_5pct", float("nan"))
+        metrics["pred_success_rate_at_10pct"] = pred_stats.get("success_rate_at_10pct", float("nan"))
+        metrics["pred_success_rate_at_20pct"] = pred_stats.get("success_rate_at_20pct", float("nan"))
 
         # lin_prob et nmi — nécessitent des étiquettes
         if labels is not None:
@@ -525,6 +585,48 @@ class UnsupervisedEvaluator:
         metrics["SI"] = column_specialization_index(per_column_sdrs)
 
         return metrics
+
+
+def sweep_consensus_threshold(
+    model,
+    inputs: torch.Tensor,
+    velocities: torch.Tensor,
+    thresholds: List[float] = [1.0, 0.75, 0.5, 0.25],
+) -> Dict[float, Dict[str, float]]:
+    """
+    Évalue evaluate() avec plusieurs seuils de consensus.
+
+    Patche temporairement model.consensus.consensus_threshold pour chaque
+    seuil, puis restaure la valeur originale. Permet de vérifier la
+    décroissance de P_fp avec K (Thm 6.3) et l'impact du seuil sur
+    epsilon et var_red.
+
+    Réf. math : §6.3 (Thm 6.3 — décroissance exponentielle P_fp avec K).
+
+    Args:
+        model:      CorticalColumn
+        inputs:     stimuli sensoriels, shape (N, input_dim)
+        velocities: vecteurs de vitesse, shape (N, 2)
+        thresholds: liste de seuils à évaluer (défaut [1.0, 0.75, 0.5, 0.25])
+
+    Returns:
+        dict { threshold: {"epsilon": ..., "consensus_mean_active": ..., "var_red": ...} }
+    """
+    original = model.consensus.consensus_threshold
+    evaluator = UnsupervisedEvaluator(model)
+    results: Dict[float, Dict[str, float]] = {}
+    try:
+        for t in thresholds:
+            model.consensus.consensus_threshold = t
+            m = evaluator.evaluate(inputs, velocities)
+            results[t] = {
+                "epsilon": m["epsilon"],
+                "consensus_mean_active": m["consensus_mean_active"],
+                "var_red": m["var_red"],
+            }
+    finally:
+        model.consensus.consensus_threshold = original
+    return results
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────

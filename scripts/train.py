@@ -180,11 +180,14 @@ def train(
     history = {
         "step": [], "cross_view_overlap": [], "pred_success_rate": [],
         "gamma": [], "gamma_surprise_ema": [], "surprise": [], "p_conn": [],
+        "mean_pairwise_column_overlap": [],
     }
 
-    _overlap_window: List[float] = []
-    _pred_window:    List[float] = []
-    _surprise_window: List[float] = []
+    _overlap_window:   List[float] = []
+    _pred_window:      List[float] = []
+    _surprise_window:  List[float] = []
+    _pairwise_window:  List[float] = []
+    last_all_sdrs:     List[torch.Tensor] = []
     images_processed = 0
     t0 = time.perf_counter()
     prev_surprise: float = 1.0
@@ -245,6 +248,7 @@ def train(
                         "sdr":           model_result["sdr"].unsqueeze(0),
                         "sdr_predicted": model_result["sdr_predicted"].unsqueeze(0),
                         "surprise":      torch.tensor([model_result["surprise"]], device=dev),
+                        "all_sdrs":      model_result["all_sdrs"],   # liste K × (n_sdr,)
                     }
                     # Mettre à jour l'état (déjà géré en interne par step())
                 else:
@@ -252,6 +256,8 @@ def train(
                         views_batch[:, v, :], vel_batch[:, v, :],
                         state_batch, train=True, gamma_override=gamma_eff,
                     )
+
+                last_all_sdrs = results["all_sdrs"]   # mis à jour à chaque vue
 
                 sdrs_episode.append(results["sdr"].cpu())
                 sdrs_predicted_episode.append(results["sdr_predicted"].cpu())
@@ -310,6 +316,30 @@ def train(
                 elapsed = time.perf_counter() - t0
                 ips = images_processed / elapsed
 
+                # mean_pairwise_column_overlap : Jaccard entre toutes les paires
+                # de colonnes, calculé sur last_all_sdrs (dernière vue du lot).
+                # Pour B==1 : liste K × (n_sdr,) ; pour B>1 : liste K × (B, n_sdr).
+                # Invariant : ne doit pas dépendre du consensus_threshold (voir sweep).
+                if last_all_sdrs and len(last_all_sdrs) >= 2:
+                    K_c = len(last_all_sdrs)
+                    pair_overlaps = []
+                    for ci in range(K_c):
+                        for cj in range(ci + 1, K_c):
+                            a = last_all_sdrs[ci].float()
+                            b = last_all_sdrs[cj].float()
+                            if a.dim() == 1:
+                                a, b = a.unsqueeze(0), b.unsqueeze(0)
+                            inter = (a * b).sum(dim=-1)
+                            union = ((a + b) > 0).float().sum(dim=-1).clamp(min=1.0)
+                            pair_overlaps.append(float((inter / union).mean().item()))
+                    col_overlap = sum(pair_overlaps) / len(pair_overlaps)
+                else:
+                    col_overlap = 0.0
+
+                _pairwise_window.append(col_overlap)
+                if len(_pairwise_window) > 100: _pairwise_window.pop(0)
+                col_overlap_smooth = sum(_pairwise_window) / len(_pairwise_window)
+
                 history["step"].append(images_processed)
                 history["cross_view_overlap"].append(overlap_smooth)
                 history["pred_success_rate"].append(pred_smooth)
@@ -317,6 +347,7 @@ def train(
                 history["gamma_surprise_ema"].append(gamma_temporal)
                 history["surprise"].append(surprise_smooth)
                 history["p_conn"].append(p_stats["frac_connected"])
+                history["mean_pairwise_column_overlap"].append(col_overlap_smooth)
 
                 logger.info(
                     f"Epoch {epoch+1} | {images_processed:6d}/{N*n_epochs} | "
@@ -325,6 +356,7 @@ def train(
                     f"ε={surprise_smooth:.3f} | "
                     f"p_conn={p_stats['frac_connected']:.2f} | "
                     f"overlap={overlap_smooth:.3f} | "
+                    f"col_overlap={col_overlap_smooth:.4f} | "
                     f"pred={pred_smooth*100:.1f}%"
                 )
 
@@ -388,6 +420,23 @@ def main() -> None:
         help="Désactive l'annealing surprise-driven — revient au schedule pur.",
     )
 
+    # ── Vote inter-colonnes (Phase 2 CMP, Clay-Leadholm 2024) ─────────────
+    parser.add_argument(
+        "--enable_vote", action="store_true",
+        help=(
+            "Active le vote inter-colonnes hebbian_update_targeted (Phase 2 CMP). "
+            "Désactivé par défaut — à activer pour forcer la convergence inter-colonnes "
+            "et observer la montée de mean_pairwise_column_overlap dans les logs."
+        ),
+    )
+    parser.add_argument(
+        "--alpha_divergence", type=float, default=3.0,
+        help=(
+            "Pénalité de dépression sur les bits divergents du vote inter-colonnes. "
+            "Ignoré si --enable_vote est absent. Défaut : 3.0."
+        ),
+    )
+
     # ── Sauvegarde ────────────────────────────────────────────────────────
     parser.add_argument(
         "--save_path", type=str, default=None,
@@ -421,6 +470,8 @@ def main() -> None:
         n_grid_modules=args.n_grid_modules,
         grid_periods=grid_periods_list,
         consensus_threshold=1.0,
+        enable_vote=args.enable_vote,
+        alpha_divergence=args.alpha_divergence,
         sp_kwargs={
             "newborn_steps":     newborn_steps,
             "tau_decay":         tau_decay,
